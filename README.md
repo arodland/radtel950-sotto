@@ -25,3 +25,12 @@ open RT-950 firmware tree for startup and drivers):
     make SOTTO=~/code/radtel950/sotto RT=~/software/Radtel-RT950-Pro-Firmware   # dvtx.BTF
     make receiver                                                               # libsottodec.so, sotto_dec_fx_d1
     python3 ../flash.py dvtx.BTF                                                # radio already running a test image
+
+## Todo
+
+- Audio quality is still not satisfactory. Next:
+  - more EQ work, possibly a high-cut; it can go into the existing FIR at no extra cost
+  - a noise gate and a compressor ahead of the encoder
+- CPU on the radio leaves room:
+  - encoder about 1.0 M cycles per 10 ms on average (about 100 of 240 MHz), worst call 2.9 M
+  - the 255-tap EQ runs in the 8 kHz sample interrupt
