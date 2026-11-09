@@ -182,9 +182,31 @@ static void rx_set_squelch(void)
 }
 static void dv_rx_on(void); static void dv_rx_off(void); static void led(int red, int green);
 
+/* UHF receive front end, measured 2026-11-09 (HT RSSI from a weak 9700 carrier, all 8 combinations):
+   PE12 high +37 dB (the open firmware drives it low: wrong), PE13 low +22 dB, PB0 no effect at
+   UHF; TX enables PB1 / PE14 released (high). Before this the HT received ~35-40 dB deaf. At
+   key-up the RX pins go back to floating, as for every transmission before this change. */
+static void rx_route(int on)
+{
+    if (on) {
+        gpio_set_pin(GPIOB, GPIO_PIN_1); gpio_set_pin(GPIOE, GPIO_PIN_14);
+        gpio_config_pin(GPIOB, GPIO_PIN_1, GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
+        gpio_config_pin(GPIOE, GPIO_PIN_14, GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
+        gpio_clear_pin(GPIOE, GPIO_PIN_13); gpio_set_pin(GPIOE, GPIO_PIN_12); gpio_clear_pin(GPIOB, GPIO_PIN_0);
+        gpio_config_pin(GPIOE, GPIO_PIN_13, GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
+        gpio_config_pin(GPIOE, GPIO_PIN_12, GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
+        gpio_config_pin(GPIOB, GPIO_PIN_0, GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
+    } else {
+        gpio_config_pin(GPIOE, GPIO_PIN_13, GPIO_MODE_INPUT, GPIO_CNF_FLOATING);
+        gpio_config_pin(GPIOE, GPIO_PIN_12, GPIO_MODE_INPUT, GPIO_CNF_FLOATING);
+        gpio_config_pin(GPIOB, GPIO_PIN_0, GPIO_MODE_INPUT, GPIO_CNF_FLOATING);
+    }
+}
+
 static void rx_start(void)
 {
     bk4829_bb_loops = 155;
+    rx_route(1);
     bk4829_write_reg(1, 0x38, 0xA108); bk4829_write_reg(1, 0x39, 0x0294);
     bk4829_write_reg(1, 0x30, 0x0200); delay_ms(2);
     bk4829_write_reg(1, 0x30, 0xBFF1); bk4829_write_reg(1, 0x47, 0x6140);   /* AF = FM demod (0x6040 | 1 << 8); the open firmware's 0xFB67 sounded AM-like: level fell with RF */
@@ -198,6 +220,7 @@ static void rx_start(void)
 static void rx_stop(void)
 {
     dv_rx_off();
+    rx_route(0);
     gpio_set_pin(GPIOE, GPIO_PIN_1);                        /* mute */
     gpio_clear_pin(GPIOE, GPIO_PIN_4);
     gpio_clear_pin(GPIOB, GPIO_PIN_8);                      /* internal mic */
@@ -212,7 +235,7 @@ static void rx_poll(void)                                   /* from the idle loo
     rx_poll_t = get_tick();
     /* software squelch on RSSI (REG_67 bits 8:0, ~0.5 dB units) with hysteresis; the BK's own
        squelch flag (REG_0C bit 1) never opened for us */
-    static const uint16_t sq_open[9] = {40, 50, 60, 70, 80, 95, 110, 130, 150};
+    static const uint16_t sq_open[9] = {100, 110, 120, 130, 140, 155, 170, 190, 210};   /* idle floor ~115 with the RX route */
     uint16_t rssi = bk4829_read_reg(1, 0x67) & 0x1FF; rx_rssi = rssi;
     if (!rx_sql) rx_open = 1;
     else if (rssi >= sq_open[rx_sql - 1]) rx_open = 1;
