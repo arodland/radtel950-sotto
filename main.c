@@ -240,6 +240,9 @@ static volatile int16_t xring[XRING];                 /* DV receive: PA2 at 19.2
 static volatile int16_t rref[XRING];                  /* the DAC's output at each of those samples */
 static volatile uint32_t x_head; static uint32_t x_tail;
 static volatile int rx_dv; static int32_t rdc_q8 = 1220 << 8;
+#define QRING 4096
+static int16_t qring[QRING];                         /* DAC samples at 19.2 kHz, written by the ADC ISR */
+static volatile uint32_t q_tail; static uint32_t q_head; static volatile int q_play, q_run;
 static volatile uint32_t dac_inc, dac_ph;      /* D<hz>: DAC1 (PA4) test sine during capture, 0 = off */
 static const int16_t sin64[64] = {0,50,100,149,196,241,284,325,362,396,426,452,473,490,502,510,512,510,502,490,473,452,426,396,362,325,284,241,196,149,100,50,0,-50,-100,-149,-196,-241,-284,-325,-362,-396,-426,-452,-473,-490,-502,-510,-512,-510,-502,-490,-473,-452,-426,-396,-362,-325,-284,-241,-196,-149,-100,-50};   /* one period */             /* R command: ring gets the pre-EQ samples */
 
@@ -259,6 +262,14 @@ void TIM6_IRQHandler(void)
         rdc_q8 += (a - rdc_q8) >> 12;
         xring[x_head % XRING] = (int16_t)((a - rdc_q8) >> 5);
         rref[x_head % XRING] = (int16_t)((int32_t)(DAC->DOR1 & 0xFFF) - 2048); x_head++;
+        if (q_play) {                        /* the DAC changes right after a conversion: every ADC sample
+                                                sees one stable, known DAC value (the leak stays LTI) */
+            int32_t v = 0;
+            if (!q_run && q_head - q_tail >= 1152) q_run = 1;           /* 60 ms queued */
+            if (q_run) { if (q_tail != q_head) { v = qring[q_tail % QRING]; q_tail++; } else q_run = 0; }
+            v = 2048 + v;
+            DAC->DHR12R1 = (uint32_t)(v < 0 ? 0 : v > 4095 ? 4095 : v);
+        }
         return;
     }
     if (dac_inc) { dac_ph += dac_inc; DAC->DHR12R1 = (uint32_t)(2048 + sin64[dac_ph >> 26]); }
@@ -342,9 +353,21 @@ static struct dvrx *dvr; static struct sotto_lr_dec *sdec;
 static size_t dv_heap_mark; static int dv_ending; static uint32_t dv_maxcyc;
 static struct dyn dv_dyn;
 static uint32_t dv_overs;                   /* DV overs received since boot */                   /* playback compressor: the DAC path is weaker than the BK's */
-#define EC_L 8
-#define EC_MU 0.05f
-static float ec_w[EC_L], ec_h[EC_L], ec_pw;
+/* DAC -> PA2 leak model, measured with the E command (DAC noise under a quiet carrier, 2026-11-09):
+   8 direct taps + 5 one-pole low-passed copies of the reference (the AC-coupled part, ~0.7 ms).
+   Fixed fit: 35-36 dB at any level (19 dB is the receive noise floor at low level); a slow NLMS
+   keeps it tracking. Valid only with the DAC written from the ADC ISR (one DAC value per sample). */
+#define EC_F 8
+#define EC_P 5
+#define EC_N (EC_F + EC_P)
+#define EC_MU 0.0f                              /* adaptation off: in speech pauses the tiny reference let the
+                                                    received signal drag the weights away; the calibration holds */
+static const float ec_pole[EC_P] = {0.8f, 0.9f, 0.95f, 0.98f, 0.995f};
+static const float ec_w0[EC_N] = {-1.2616f, -0.3055f, -0.1218f, -0.0474f, -0.0163f, -0.0036f, 0.0017f, 0.0029f,
+                                  -0.2576f, 0.3264f, 0.0665f, -0.0400f, 0.0028f};
+static float ec_w[EC_N], ec_h[EC_N], ec_pw;
+static uint32_t gcap_at, gcap_n, gcap_cnt;   /* G: (x, ref) pairs from a real over, in pring */
+static float st_x2, st_y2, st_r2; static uint32_t st_n, st_clip, st_rclip;   /* per-over canceller stats */
 static void timer6_rx(int on)
 {
     TIM6->CR1 = 0; NVIC_DisableIRQ(TIM6_IRQn); rx_dv = on;
@@ -390,10 +413,23 @@ static void dv_rx_on(void)
 }
 static void dv_rx_off(void)
 {
-    timer6_rx(0); dac_player(0);
+    timer6_rx(0); dac_player(0); q_play = 0;
     if (dv_active) dv_speaker(0);
     dv_ending = 0; dvr = 0; sdec = 0;
     bk_apply(mic_setup, (int)(sizeof mic_setup / sizeof mic_setup[0]));   /* chip 0 back to mic capture for TX */
+}
+static int16_t up_prev; static uint32_t up_ph;          /* 8 -> 19.2 kHz: output k at input position k * 5 / 12 */
+static void q_push8k(const int16_t *y, int n)            /* decoded speech in, DAC offsets (x 1/8) out */
+{
+    for (int i = 0; i < n; i++) {
+        int32_t a = up_prev, b = y[i];
+        while (up_ph < 12) {                                  /* outputs between input i-1 and i: phase 0..11 /12 */
+            int32_t v = a + (b - a) * (int32_t)up_ph / 12;
+            if (q_head - q_tail < QRING) { qring[q_head % QRING] = (int16_t)(v >> 3); q_head++; }
+            up_ph += 5;
+        }
+        up_ph -= 12; up_prev = y[i];
+    }
 }
 static void pcm_push(const int16_t *y, int n)
 {
@@ -406,15 +442,20 @@ static void dv_poll(void)
        DAC output sampled at the same instants as the reference */
     while (x_tail != x_head) {
         if (x_head - x_tail > XRING) x_tail = x_head - XRING;              /* overrun: skip */
-        float xr = xring[x_tail % XRING];
-        for (int k = EC_L - 1; k > 0; k--) ec_h[k] = ec_h[k - 1];
-        ec_h[0] = rref[x_tail % XRING];
+        float xr = xring[x_tail % XRING], rf = rref[x_tail % XRING];
+        if (dv_active && gcap_n < PRING / 2 && ++gcap_cnt > gcap_at) { pring[2 * gcap_n] = (int16_t)xr; pring[2 * gcap_n + 1] = (int16_t)rf; gcap_n++; }
+        for (int k = EC_F - 1; k > 0; k--) ec_h[k] = ec_h[k - 1];
+        ec_h[0] = rf;
+        for (int k = 0; k < EC_P; k++) ec_h[EC_F + k] = rf + ec_pole[k] * ec_h[EC_F + k];
         float y = xr;
-        for (int k = 0; k < EC_L; k++) y -= ec_w[k] * ec_h[k];
+        for (int k = 0; k < EC_N; k++) y -= ec_w[k] * ec_h[k];
         if (dv_active) {
-            ec_pw += 0.002f * (ec_h[0] * ec_h[0] - ec_pw);
-            float g = EC_MU * y / (EC_L * ec_pw + 100.0f);
-            for (int k = 0; k < EC_L; k++) ec_w[k] += g * ec_h[k];
+            st_x2 += xr * xr; st_y2 += y * y; st_r2 += rf * rf; st_n++;
+            if (xr > 16000 || xr < -16000) st_clip++;
+            if (rf >= 2047 || rf <= -2048) st_rclip++;
+            float nrm = 0; for (int k = 0; k < EC_N; k++) nrm += ec_h[k] * ec_h[k];
+            float g = EC_MU * y / (nrm + 1000.0f);
+            for (int k = 0; k < EC_N; k++) ec_w[k] += g * ec_h[k];
         }
         x_tail++;
         dvrx_push(dvr, (int16_t)(y > 32767 ? 32767 : y < -32767 ? -32767 : y));
@@ -424,30 +465,35 @@ static void dv_poll(void)
     while ((ev = dvrx_step(dvr, sf, &good)) != DVRX_NONE) {
         if (ev == DVRX_LOCK) {
             heap_used = dv_heap_mark; sdec = sotto_lr_dec_create();    /* a fresh decoder per over */
-            for (int k = 0; k < EC_L; k++) ec_w[k] = ec_h[k] = 0;
+            for (int k = 0; k < EC_N; k++) ec_w[k] = ec_w0[k];
+            st_x2 = st_y2 = st_r2 = 0; st_n = st_clip = st_rclip = 0;
+            gcap_n = 0; gcap_cnt = 0; gcap_at = 19200;
             dyn_reset(&dv_dyn);
-            ec_pw = 0;
-            dac_player(1); dv_speaker(1); dv_ending = 0; dv_maxcyc = 0;
+            q_head = q_tail = 0; q_run = 0; up_prev = 0; up_ph = 0; q_play = 1; dv_speaker(1); dv_ending = 0; dv_maxcyc = 0;
             dvrx_relevel_at(dvr, dvrx_count(dvr) + (x_head - x_tail) + 64);   /* the BK just got 35 dB quieter */
             out_s("DV lock\r\n");
         } else if (ev == DVRX_FRAME && sdec) {
             sotto_lr_decode(sdec, sf, good, pcm);
             for (int i = 0; i < SOTTO_LR_SAMPLES_PER_FRAME; i += DY_B) dyn_block(&dv_dyn, pcm + i);
-            pcm_push(pcm, SOTTO_LR_SAMPLES_PER_FRAME);
+            q_push8k(pcm, SOTTO_LR_SAMPLES_PER_FRAME);
         } else if (ev == DVRX_END && sdec) {
             while (sotto_lr_dec_flush(sdec, pcm)) {
                 for (int i = 0; i < SOTTO_LR_SAMPLES_PER_FRAME; i += DY_B) dyn_block(&dv_dyn, pcm + i);
-                pcm_push(pcm, SOTTO_LR_SAMPLES_PER_FRAME);
+                q_push8k(pcm, SOTTO_LR_SAMPLES_PER_FRAME);
             }
             int f, b, se; dvrx_stats(dvr, &f, &b, &se);
             out_s("DV end frames="); out_u((uint32_t)f); out_s(" bad="); out_u((uint32_t)b);
             out_s(" ser_milli="); out_u((uint32_t)se); out_s(" max_cyc="); out_u(dv_maxcyc);
-            out_s(" pcm_queued="); out_u(p_head); out_s(" played="); out_u(p_tail); out_s(" ec_w0="); out_u((uint32_t)(int32_t)(ec_w[0] * 1000)); out_s("\r\n");
+            out_s(" w0_milli="); out_u((uint32_t)(int32_t)(ec_w[0] * 1000));
+            { float n = st_n ? (float)st_n : 1.0f;
+              out_s(" rms_x="); out_u((uint32_t)dy_sqrt(st_x2 / n)); out_s(" rms_y="); out_u((uint32_t)dy_sqrt(st_y2 / n));
+              out_s(" rms_ref="); out_u((uint32_t)dy_sqrt(st_r2 / n)); out_s(" adc_near_rail="); out_u(st_clip); out_s(" dac_clip="); out_u(st_rclip); out_s(" n="); out_u(st_n); }
+            out_s("\r\n");
             dv_ending = 1; dv_overs++;
         }
         uint32_t dt = CYC - c0; if (dt > dv_maxcyc) dv_maxcyc = dt; c0 = CYC;
     }
-    if (dv_ending && p_tail == p_head) { dac_player(0); dv_speaker(0); dv_ending = 0; }
+    if (dv_ending && q_tail == q_head) { q_play = 0; DAC->DHR12R1 = 2048; dv_speaker(0); dv_ending = 0; }
 }
 
 /* ------------------------------------------------------------------ FEC + framing */
@@ -766,6 +812,47 @@ int main(void)
         else if (line[0] == 'B') {                 /* B1: DAC1 output buffer on (drives the speaker node), B0 off */
             if (line[1] == '1') DAC->CR &= ~(1UL << 1); else DAC->CR |= (1UL << 1);
             out_s("ok\r\n");
+        }
+        else if (line[0] == 'E') {                 /* E<amp>: leak capture: DAC plays noise of +-amp (pcm units, max
+                                                      16383 = full scale) on the DV speaker path while PA2 and the DAC
+                                                      reference are recorded at 19.2 kHz; dumps "EDUMP n" + n x (x, ref) int16 */
+            uint32_t amp = 0, pole = 0; const char *q = line + 1;      /* E<amp>[,<pole x 1000>]: noise through a one-pole low-pass */
+            for (; *q >= '0' && *q <= '9'; q++) amp = amp * 10 + (uint32_t)(*q - '0');
+            if (*q == ',') for (q++; *q >= '0' && *q <= '9'; q++) pole = pole * 10 + (uint32_t)(*q - '0');
+            if (amp > 16383) amp = 16383;
+            float lp = 0, pk = pole / 1000.0f, gk = 1.0f - pk;
+            #define EN 4800
+            timer6_rx(0); dvr = 0; heap_used = 0;
+            int16_t *eb = (int16_t *)malloc(EN * 4);
+            uint32_t lcg = 12345;
+            dv_speaker(1); q_head = q_tail = 0; q_run = 0; q_play = 1;
+            x_head = x_tail = 0; timer6_rx(1);
+            uint32_t got = 0, skip = 1920;
+            while (got < EN) {
+                while (q_head - q_tail < QRING - 64) {
+                    lcg = lcg * 1664525u + 1013904223u;
+                    float v = (float)(((int32_t)(lcg >> 16) - 32768) * (int32_t)amp / 32768 / 8);
+                    lp = pk * lp + gk * v * (pole ? 4.0f : 1.0f);          /* low-passed noise, roughly level-matched */
+                    if (lp > 2047) lp = 2047; if (lp < -2047) lp = -2047;
+                    qring[q_head % QRING] = (int16_t)(pole ? lp : v); q_head++;
+                }
+                while (x_tail != x_head && got < EN) {
+                    if (skip) skip--;
+                    else { eb[2 * got] = xring[x_tail % XRING]; eb[2 * got + 1] = rref[x_tail % XRING]; got++; }
+                    x_tail++;
+                }
+                housekeeping();
+            }
+            timer6_rx(0); q_play = 0; DAC->DHR12R1 = 2048; dv_speaker(0);
+            out_s("EDUMP "); out_u(EN); out_s("\r\n");
+            for (uint32_t i = 0; i < 2 * EN; i++) { uart_putc((uint8_t)eb[i]); uart_putc((uint8_t)((uint16_t)eb[i] >> 8)); }
+            out_s("DONE\r\n");
+            dv_rx_on();
+        }
+        else if (line[0] == 'G') {                 /* G: dump the (x, ref) pairs captured 1 s into the last DV over */
+            out_s("GDUMP "); out_u(gcap_n); out_s("\r\n");
+            for (uint32_t i = 0; i < 2 * gcap_n; i++) { uart_putc((uint8_t)pring[i]); uart_putc((uint8_t)((uint16_t)pring[i] >> 8)); }
+            out_s("DONE\r\n");
         }
         else if (line[0] == 'S') {                 /* S: 2 s 700 Hz test tone through the DV player path */
             int16_t blk[80]; dac_player(1); dv_speaker(1);
