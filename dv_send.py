@@ -8,6 +8,14 @@ HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE)
 import dvframe as d, dv_live as L
 FS = 48000
 
+def frames_audio(frames, level=0.3):
+    """48-bit superframes (bit arrays) -> the over as continuous-phase 4-FSK audio at 48 kHz"""
+    syms = np.concatenate([d.preamble()] + [d.frame_symbols(f) for f in frames] + [np.array([0, 3] * 16)])
+    ph, out, n = 0.0, [], np.arange(40)
+    for k in syms:
+        out.append(np.sin(ph + 2 * np.pi * 600 * (k + 1) * n / FS)); ph += 2 * np.pi * 600 * (k + 1) * 40 / FS
+    return (level * 32767 * np.concatenate(out)).astype(np.int16)
+
 def dv_audio(path, level=0.3):
     w = wave.open(path); assert w.getframerate() == 8000 and w.getnchannels() == 1
     pcm = w.readframes(w.getnframes())
@@ -16,11 +24,7 @@ def dv_audio(path, level=0.3):
         subprocess.run([f"{HERE}/sotto_enc_fx_lo", "-1200", f"{td}/in.raw", f"{td}/out.bit"], check=True)
         bits = open(f"{td}/out.bit", "rb").read()
     frames = [np.unpackbits(np.frombuffer(bits[i:i + 6], np.uint8)) for i in range(0, len(bits) - 5, 6)]
-    syms = np.concatenate([d.preamble()] + [d.frame_symbols(f) for f in frames] + [np.array([0, 3] * 16)])
-    ph, out, n = 0.0, [], np.arange(40)
-    for k in syms:
-        out.append(np.sin(ph + 2 * np.pi * 600 * (k + 1) * n / FS)); ph += 2 * np.pi * 600 * (k + 1) * 40 / FS
-    return (level * 32767 * np.concatenate(out)).astype(np.int16), len(frames)
+    return frames_audio(frames, level), len(frames)
 
 if __name__ == "__main__":
     y, nf = dv_audio(sys.argv[1], float(sys.argv[2]) if len(sys.argv) > 2 else 0.3)

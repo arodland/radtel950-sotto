@@ -340,7 +340,8 @@ static void push_sym(uint8_t t) { yring[y_head % YRING] = t; y_head++; }
 extern void *malloc(size_t);
 static struct dvrx *dvr; static struct sotto_lr_dec *sdec;
 static size_t dv_heap_mark; static int dv_ending; static uint32_t dv_maxcyc;
-static struct dyn dv_dyn;                   /* playback compressor: the DAC path is weaker than the BK's */
+static struct dyn dv_dyn;
+static uint32_t dv_overs;                   /* DV overs received since boot */                   /* playback compressor: the DAC path is weaker than the BK's */
 #define EC_L 8
 #define EC_MU 0.05f
 static float ec_w[EC_L], ec_h[EC_L], ec_pw;
@@ -442,7 +443,7 @@ static void dv_poll(void)
             out_s("DV end frames="); out_u((uint32_t)f); out_s(" bad="); out_u((uint32_t)b);
             out_s(" ser_milli="); out_u((uint32_t)se); out_s(" max_cyc="); out_u(dv_maxcyc);
             out_s(" pcm_queued="); out_u(p_head); out_s(" played="); out_u(p_tail); out_s(" ec_w0="); out_u((uint32_t)(int32_t)(ec_w[0] * 1000)); out_s("\r\n");
-            dv_ending = 1;
+            dv_ending = 1; dv_overs++;
         }
         uint32_t dt = CYC - c0; if (dt > dv_maxcyc) dv_maxcyc = dt; c0 = CYC;
     }
@@ -736,7 +737,10 @@ int main(void)
         }
         else if (line[0] == 'I') {                 /* I: receiver status */
             out_s("RX rssi="); out_u(rx_rssi); out_s(" reg0c="); out_u(bk4829_read_reg(1, 0x0C));
-            out_s(" open="); out_u((uint32_t)rx_open); out_s(" vol="); out_u((uint32_t)rx_vol); out_s(" sql="); out_u((uint32_t)rx_sql); out_s("\r\n");
+            out_s(" open="); out_u((uint32_t)rx_open); out_s(" vol="); out_u((uint32_t)rx_vol); out_s(" sql="); out_u((uint32_t)rx_sql);
+            out_s(" dv_overs="); out_u(dv_overs);
+            if (dvr) { int f, b, se; dvrx_stats(dvr, &f, &b, &se); out_s(" last: frames="); out_u((uint32_t)f); out_s(" bad="); out_u((uint32_t)b); out_s(" ser_milli="); out_u((uint32_t)se); }
+            out_s("\r\n");
         }
         else if (line[0] == 'A') {                 /* A<v>: APC DAC value for the next overs */
             uint32_t v = 0;

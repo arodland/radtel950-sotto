@@ -174,6 +174,7 @@ class Rx:
             else: gmask = int(good)
             self.gmasks.append(gmask)
             pb = np.packbits(bits).tobytes()
+            if getattr(self, 'on_frame', None): self.on_frame(bits, gmask)
             for k in range(FMT.SF_PER_FRAME): self.play(self.dec.decode(pb[6 * k: 6 * k + 6], gmask))
             self.n += 1; self.nbad += not good; self.sers.append(ser)
             self.bad = 0 if good else self.bad + 1
@@ -212,23 +213,34 @@ class Parrot:
     input (set the 9700's MOD input to USB). Overs shorter than MIN_S are ignored."""
     SINK = "alsa_output.usb-Burr-Brown_from_TI_USB_Audio_CODEC-00.analog-stereo"
     MIN_S, MAX_S = 1.0, 30.0
-    def __init__(self, civ, level=0.4): self.civ = civ; self.level = level; self.buf = []; self.busy = False
+    def __init__(self, civ, level=0.4, dv=False):
+        self.civ = civ; self.level = level; self.dv = dv; self.buf = []; self.frames = []; self.last = None; self.busy = False
     def audio(self, y): self.buf.append(y)
+    def frame(self, bits, good):                       # DV parrot: relay the received superframes
+        if good: self.last = bits.copy()
+        if self.last is not None: self.frames.append(self.last if not good else bits.copy())   # bad: hold the last good one
     def over_end(self):
         y = np.concatenate(self.buf) if self.buf else np.zeros(0, np.int16); self.buf = []
+        frames, self.frames, self.last = self.frames[:-BAD_RUN], [], None   # the hold frames are the over's tail
         if len(y) < self.MIN_S * 8000 or self.busy: return
-        y = y[:int(self.MAX_S * 8000)]
-        threading.Thread(target=self.send, args=(y,), daemon=True).start()
-    def send(self, y):
+        if self.dv:
+            if len(frames) < self.MIN_S * 25: return
+            from dv_send import frames_audio
+            y48 = frames_audio(frames[:int(self.MAX_S * 25)], 0.3); what = f"DV {len(frames) * 0.04:.1f} s"
+        else:
+            from scipy.signal import resample_poly                    # PipeWire's own 8 -> 48 kHz path stuttered
+            y = y[:int(self.MAX_S * 8000)]
+            y48 = np.clip(resample_poly(y.astype(float), 6, 1) * self.level, -32767, 32767).astype(np.int16)
+            what = f"FM {len(y) / 8000:.1f} s"
+        threading.Thread(target=self.send, args=(y48, what), daemon=True).start()
+    def send(self, y48, what):
         self.busy = True
         try:
             self.civ.ptt(True); time.sleep(0.4)
-            from scipy.signal import resample_poly                    # PipeWire's own 8 -> 48 kHz
-            y48 = np.clip(resample_poly(y.astype(float), 6, 1) * self.level, -32767, 32767).astype(np.int16)   # path stuttered
             subprocess.run(["pw-play", f"--target={self.SINK}", "--rate=48000", "--channels=1", "--format=s16",
                             "--raw", "-"], input=y48.tobytes(), check=False)
             time.sleep(0.3); self.civ.ptt(False)
-            print(f"{time.strftime('%H:%M:%S')} parrot: sent {len(y) / 8000:.1f} s", flush=True)
+            print(f"{time.strftime('%H:%M:%S')} parrot: sent {what}", flush=True)
         finally:
             self.civ.ptt(False); self.busy = False
 
@@ -236,7 +248,7 @@ def main():
     ap = argparse.ArgumentParser(); ap.add_argument("--src", default=SRC); ap.add_argument("--wav")
     ap.add_argument("--hold", type=int, default=BAD_RUN, help="bad frames in a row before dropping lock")
     ap.add_argument("--noncoh", action="store_true", help="noncoherent (Goertzel + tone-pair trellis) detection instead of coh.py")
-    ap.add_argument("--parrot", action="store_true", help="retransmit each over on the IC-9700 (CI-V PTT, USB audio)")
+    ap.add_argument("--parrot", nargs="?", const="dv", choices=["dv", "fm"], help="retransmit each over on the IC-9700 (CI-V PTT, USB audio): dv relays the received superframes as a DV over (default), fm plays the decoded speech as FM")
     ap.add_argument("--smeter", metavar="OUT.tsv", help="log the IC-9700 S-meter every 0.5 s (unix time, raw)")
     ap.add_argument("--parrot-level", type=float, default=0.3, help="parrot playback level into the 9700's USB input (0-1; 0.3 is clean)")
     ap.add_argument("--replay", metavar="AIR.wav", help="decode a recording (48 kHz) instead, no playback; "
@@ -260,13 +272,13 @@ def main():
     if a.wav:
         wf = wave.open(a.wav, "wb"); wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(8000)
     civ = Civ() if (a.parrot or a.smeter) else None
-    parrot = Parrot(civ, a.parrot_level) if a.parrot else None
+    parrot = Parrot(civ, a.parrot_level, a.parrot == 'dv') if a.parrot else None
     def play(y):
         out.stdin.write(y.tobytes()); out.stdin.flush()
         if wf: wf.writeframes(y.tobytes())
         if parrot: parrot.audio(y)
     rx = Rx(play, a.hold, coherent=not a.noncoh)
-    if parrot: rx.on_over_end = parrot.over_end
+    if parrot: rx.on_over_end = parrot.over_end; rx.on_frame = parrot.frame
     if a.smeter:
         def smeter_log():
             with open(a.smeter, "a", buffering=1) as f:
