@@ -179,7 +179,7 @@ static void rx_start(void)
     bk4829_bb_loops = 155;
     bk4829_write_reg(1, 0x38, 0xA108); bk4829_write_reg(1, 0x39, 0x0294);
     bk4829_write_reg(1, 0x30, 0x0200); delay_ms(2);
-    bk4829_write_reg(1, 0x30, 0xBFF1); bk4829_write_reg(1, 0x47, 0xFB67);
+    bk4829_write_reg(1, 0x30, 0xBFF1); bk4829_write_reg(1, 0x47, 0x6140);   /* AF = FM demod (0x6040 | 1 << 8); the open firmware's 0xFB67 sounded AM-like: level fell with RF */
     rx_set_volume(); rx_set_squelch();
     gpio_set_pin(GPIOC, GPIO_PIN_12);                       /* speaker from the BK, not the MCU DAC */
     gpio_set_pin(GPIOB, GPIO_PIN_8);                        /* amplifier on */
