@@ -8,6 +8,17 @@ import os, subprocess, sys, threading, time
 import numpy as np, serial
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from mic_eq import make_stimulus, STIM
+
+def radio_port():
+    """the RT-950's USB-serial adapter re-enumerates (ttyUSB2 -> ttyUSB3 ...) when RF from the
+    antenna resets it during TX: take whichever ttyUSB isn't the IC-9700's (USB0 CI-V, USB1)"""
+    import glob, time
+    for _ in range(40):
+        p = sorted(x for x in glob.glob("/dev/ttyUSB*") if x not in ("/dev/ttyUSB0", "/dev/ttyUSB1"))
+        if p: return p[0]
+        time.sleep(0.25)
+    raise SystemExit("radio serial port not found")
+
 BANDS = [(100, 300), (300, 800), (800, 1600), (1600, 2400), (2400, 3200)]
 BASE = {0x2C: 0x003F, 0x7D: 0xE91F, 0x48: 0xB092}
 SETTINGS = [{}, {0x2C: 0x30}, {0x2C: 0x20}, {0x2C: 0x10}, {0x2C: 0x00},
@@ -28,7 +39,7 @@ def bands(x):
 
 def main():
     if not os.path.exists(STIM): make_stimulus()
-    with serial.Serial("/dev/ttyUSB2", 230400, timeout=2) as s:
+    with serial.Serial(radio_port(), 230400, timeout=2) as s:
         print("setting                      " + " ".join(f"{a}-{b}".rjust(9) for a, b in BANDS) + "   noise dBFS  peak")
         for st in SETTINGS:
             regs = {**BASE, **st}

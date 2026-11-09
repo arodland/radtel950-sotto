@@ -24,6 +24,7 @@
 #include "sotto.h"
 #include "eq_coef.h"
 #include "dyn.h"
+#include "drivers/spi.h"
 
 extern void delay_ms(uint32_t ms);
 extern volatile uint32_t bk4829_bb_loops;
@@ -130,9 +131,14 @@ static const bkw_t mic_setup[] = {          /* chip 0: mic capture "A" (mic boos
     TX_START(0), {0,0x40,0}, {0,0x47,0x6142}, {0,0x48,0xB092}, {0,0x7D,0xE91F}, {0,0x2C,0x003F},
     {0,0x2B,0}, {0,0x30,0}, {0,0x30,0x0206},
 };
-static const bkw_t tx_setup[] = {           /* chip 1: 433.000 MHz (+4 kHz crystal corrected), tones */
-    TX_START(1), {1,0x38,0xB490}, {1,0x39,0x0294}, {1,0x30,0x0200}, {1,0x30,0xC3FE}, {1,0x47,0x6042},
-    {1,0x7D,0xE900}, {1,0x2C,0}, {1,0x36,0}, {1,0x40,0x3720}, {1,0x71,BASE_TONE}, {1,0x70,0xE000},
+static const bkw_t tx_setup[] = {           /* chip 1: 432.950 MHz (same crystal correction as the 433.000 value), tones */
+    TX_START(1), {1,0x38,0xA108}, {1,0x39,0x0294}, {1,0x30,0x0200}, {1,0x30,0xC3FE}, {1,0x47,0x6042},
+    {1,0x7D,0xE900}, {1,0x2C,0}, {1,0x36,0x8E79}, {1,0x40,0x3720}, {1,0x71,BASE_TONE}, {1,0x70,0xE000},
+};
+
+static const bkw_t fm_setup[] = {           /* chip 1: FM voice at the same frequency and power (PTT2) */
+    TX_START(1), {1,0x38,0xA108}, {1,0x39,0x0294}, {1,0x2C,0x0022}, {1,0x7D,0xE91A}, {1,0x48,0xB3FF},   /* mic gain 0x1A (chip default 0x12 was a bit low; 0x1F max) */
+    {1,0x36,0x8E79}, {1,0x47,0x6656}, {1,0x30,0x0200}, {1,0x30,0xC1FE},
 };
 
 static void bk_apply(const bkw_t *w, int n) { for (int i = 0; i < n; i++) bk4829_write_reg(w[i].chip, w[i].reg, w[i].val); }
@@ -146,7 +152,10 @@ static void pa_route(int on)                /* nicFW's UHF TX route; APC (DAC2) 
     gpio_config_pin(GPIOE, GPIO_PIN_7, GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
 }
 
-static bkw_t ovr[8]; static int n_ovr;      /* X c,rr,vvvv: extra writes after tx_setup (test knob) */
+static bkw_t ovr[8]; static int n_ovr;
+static uint16_t apc = 2200;                 /* A<v>: DAC2 (PA5, PA power control) while keyed. Factory table at
+                                               433 MHz: low 1968 (1.2 W with REG_36 = 0x8E79), mid 2496 (4.1 W);
+                                               2200 is about 2 W. 0 = a few uW */      /* X c,rr,vvvv: extra writes after tx_setup (test knob) */
 
 /* ------------------------------------------------------------------ capture (TIM6, 8 kHz) */
 #define SRING 2048
@@ -257,6 +266,14 @@ static void report_sf(uint32_t frame, int k, const uint8_t *b)
 }
 
 static int ptt_down(void) { return (GPIOE->IDR & (GPIO_PIN_3 | GPIO_PIN_2)) != (GPIO_PIN_3 | GPIO_PIN_2); }
+static int ptt1_down(void) { return !(GPIOE->IDR & GPIO_PIN_3); }
+static int ptt2_down(void) { return !(GPIOE->IDR & GPIO_PIN_2); }
+#define LED_ON 1                            /* PC13 red, PC14 green (rt950_pinmap.h) */
+static void led(int red, int green)
+{
+    if (red == LED_ON) gpio_set_pin(GPIOC, GPIO_PIN_13); else gpio_clear_pin(GPIOC, GPIO_PIN_13);
+    if (green == LED_ON) gpio_set_pin(GPIOC, GPIO_PIN_14); else gpio_clear_pin(GPIOC, GPIO_PIN_14);
+}
 
 #define PTT_RELEASE 160                     /* samples (20 ms) up before the over ends: debounce */
 #define PTT_TOT (180 * 8000)                /* time-out timer */
@@ -277,7 +294,7 @@ static void transmit(uint32_t secs)
     /* key up: route + chip 1 TX + tone generator; chip 0 already capturing */
     s_head = s_tail = s_overrun = 0; dc_q8 = 1220 << 8; y_head = y_tail = y_underrun = 0; y_last = 3;
     bk4829_bb_loops = 155;                  /* setup at the proven read speed; 4 lost writes */
-    pa_route(1);
+    led(1, 0); pa_route(1); DAC->DHR12R2 = apc;
     bk_apply(tx_setup, (int)(sizeof tx_setup / sizeof tx_setup[0]));
     bk_apply(ovr, n_ovr);
     bk4829_bb_loops = 30;                   /* symbol writes: ~20 us each */
@@ -334,12 +351,28 @@ static void transmit(uint32_t secs)
     /* unkey */
     bk4829_bb_loops = 155;
     bk4829_write_reg(1, 0x70, 0); bk4829_write_reg(1, 0x30, 0);
-    pa_route(0);
+    pa_route(0); DAC->DHR12R2 = 0; led(0, 0);
     sotto_lr_enc_destroy(e);
     out_s("STAT frames="); out_u(frames); out_s(" superframes="); out_u(nsf);
     out_s(" enc10ms_mean_cyc="); out_u(nenc ? (uint32_t)(enc_sum / nenc) : 0); out_s(" enc_max_cyc="); out_u(enc_max);
     out_s(" sym_underruns="); out_u(y_underrun); out_s(" sym_fill_max="); out_u(fill_max);
     out_s(" pcm_overruns="); out_u(s_overrun); out_s(" pre_filler="); out_u(pre); out_s(" fill_min_before_push="); out_u(fill_min); out_s("\r\nDONE\r\n");
+}
+
+/* PTT2: plain FM voice (stock TX path, mic at the chip's defaults) at the same power, until released */
+static void transmit_fm(void)
+{
+    led(0, 1); bk4829_bb_loops = 155;
+    pa_route(1); DAC->DHR12R2 = apc;
+    bk_apply(fm_setup, (int)(sizeof fm_setup / sizeof fm_setup[0]));
+    uint32_t up = 0, t0 = get_tick();
+    while (up < 20 && get_tick() - t0 < 180000) {     /* 20 ms release debounce, 180 s timeout */
+        housekeeping(); delay_ms(1);
+        up = ptt2_down() ? 0 : up + 1;
+    }
+    bk4829_write_reg(1, 0x30, 0); bk4829_write_reg(1, 0x36, 0);
+    pa_route(0); DAC->DHR12R2 = 0; led(0, 0);
+    out_s("FM over\r\n");
 }
 
 int main(void)
@@ -381,7 +414,7 @@ int main(void)
     bk4829_write_reg(0, 0x30, 0); bk4829_write_reg(1, 0x30, 0);
     pa_route(0);
 
-    adc_init();
+    adc_init(); spi2_init();
     CRM->APB1EN |= CRM_APB1EN_DACEN;                            /* as the test firmware: */
     gpio_config_pin(GPIOA, GPIO_PIN_5, GPIO_MODE_INPUT, GPIO_CNF_ANALOG);
     DAC->CR |= (1UL << 0) | (1UL << 1) | (1UL << 16);           /* DAC1 (beep, on the mic node) */
@@ -394,6 +427,7 @@ int main(void)
     char line[20];
     gpio_config_pin(GPIOE, GPIO_PIN_3, GPIO_MODE_INPUT, GPIO_CNF_PULL); gpio_set_pin(GPIOE, GPIO_PIN_3);  /* PTT1 */
     gpio_config_pin(GPIOE, GPIO_PIN_2, GPIO_MODE_INPUT, GPIO_CNF_PULL); gpio_set_pin(GPIOE, GPIO_PIN_2);  /* PTT2 */
+    led(0, 0); gpio_config_pin(GPIOC, GPIO_PIN_13, GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP); gpio_config_pin(GPIOC, GPIO_PIN_14, GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
     uint32_t down_ms = 0;
     for (;;) {
         housekeeping();
@@ -415,9 +449,9 @@ int main(void)
             }
         }
 #endif
-        if (ptt_down()) {                   /* 20 ms held: key up */
+        if (ptt_down()) {                   /* 20 ms held: PTT1 = DV, PTT2 = FM voice */
             delay_ms(1);
-            if (++down_ms >= 20) { transmit(0); down_ms = 0; }
+            if (++down_ms >= 20) { if (ptt1_down()) transmit(0); else if (ptt2_down()) transmit_fm(); down_ms = 0; }
             continue;
         }
         down_ms = 0;
@@ -470,6 +504,21 @@ int main(void)
             }
             capture_start(0); raw_cap = 0;
             out_s("STAT pcm_overruns="); out_u(s_overrun); out_s("\r\nDONE\r\n");
+        }
+        else if (line[0] == 'A') {                 /* A<v>: APC DAC value for the next overs */
+            uint32_t v = 0;
+            for (const char *q = line + 1; *q >= '0' && *q <= '9'; q++) v = v * 10 + (uint32_t)(*q - '0');
+            apc = (uint16_t)(v > 4095 ? 4095 : v); out_s("ok\r\n");
+        }
+        else if (line[0] == 'C') {                 /* C: factory TX power calibration, 12 bands x (low, mid, high) */
+            uint8_t cal[192]; spi_flash_read(0x00F000, cal, 192);
+            for (int b = 0; b < 12; b++) {
+                out_s("CAL "); out_u((uint32_t)b);
+                for (int k = 0; k < 8; k++) { out_s(" "); out_u((uint32_t)cal[b * 16 + 2 * k] | ((uint32_t)cal[b * 16 + 2 * k + 1] << 8)); }
+                out_s("\r\n");
+            }
+            uint8_t e[32]; spi_flash_read(0x00F230, e, 32);
+            out_s("EDGES"); for (int i = 0; i < 32; i++) { out_s(" "); out_u(e[i]); } out_s("\r\n");
         }
         else if (line[0] == 'T') {
             uint32_t secs = 0;

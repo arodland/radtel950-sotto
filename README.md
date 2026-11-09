@@ -8,7 +8,7 @@ About 240 ms mouth to ear (80 ms frames; the 40 ms format is kept as V2 for old 
   - PTT (either button) transmits. The power knob works.
   - Serial (UART4, 230400): `T<secs>` sends a timed over, `!` resets to the bootloader,
     `X`/`W` override BK4829 registers, `Pxn=0|1|z` drives a pin.
-  - Fixed at 433.000 MHz, minimum APC.
+  - Fixed at 432.950 MHz, minimum APC.
 - `dvframe.py`: the air formats, reference encoder and decoder. `gen_tables.py` writes the
   firmware's tables (`dvtables.h`) from it.
   - V3 (current): 80 ms frames, 4 sync + 92 data symbols, 2 superframes. K=7 rate-1/2 code:
@@ -29,7 +29,7 @@ About 240 ms mouth to ear (80 ms frames; the 40 ms format is kept as V2 for old 
   superframes the radio reports. Uses `../rig.py` for recording.
 - `gen_eq.py` -> `eq_coef.h`: the mic EQ (FIR, applied on the radio).
 - `smeter.py`, `walk_eval.py`: walk-test logging (IC-9700 S-meter over CI-V) and offline
-  analysis by signal level. Walk 2026-11-09 (V2, dummy-load leakage): clean at S5 and up,
+  analysis by signal level. Walk 2026-11-09 (V2, rubber duck, minimum APC): clean at S5 and up,
   errors from S3-4, breaks up near S2.
 
 Build (needs the sotto `fx-1200-encoder` branch, https://github.com/arodland/sotto, and the

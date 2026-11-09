@@ -2,8 +2,19 @@
 """Record the radio's mic (dvtx R command: DC removed, x16, before the EQ) to a wav, no TX.
 usage: mic_cap.py SECS OUT.wav"""
 import sys, wave, serial
+
+def radio_port():
+    """the RT-950's USB-serial adapter re-enumerates (ttyUSB2 -> ttyUSB3 ...) when RF from the
+    antenna resets it during TX: take whichever ttyUSB isn't the IC-9700's (USB0 CI-V, USB1)"""
+    import glob, time
+    for _ in range(40):
+        p = sorted(x for x in glob.glob("/dev/ttyUSB*") if x not in ("/dev/ttyUSB0", "/dev/ttyUSB1"))
+        if p: return p[0]
+        time.sleep(0.25)
+    raise SystemExit("radio serial port not found")
+
 secs, out = int(sys.argv[1]), sys.argv[2]
-with serial.Serial("/dev/ttyUSB2", 230400, timeout=2) as s:
+with serial.Serial(radio_port(), 230400, timeout=2) as s:
     s.reset_input_buffer(); s.write(f"R{secs}\r".encode())
     n = int(s.readline().split()[1]); print("recording", n / 8000, "s", flush=True)
     s.timeout = secs + 5                      # pyserial's timeout bounds the whole read

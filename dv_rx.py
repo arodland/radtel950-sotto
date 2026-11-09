@@ -10,6 +10,16 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import dvframe as d
 
+def radio_port():
+    """the RT-950's USB-serial adapter: it re-enumerates (ttyUSB2 -> ttyUSB3 ...) when RF from the
+    antenna resets it during TX, so take whichever ttyUSB isn't the IC-9700's (USB0 CI-V, USB1)"""
+    import glob, time
+    for _ in range(40):
+        p = sorted(x for x in glob.glob("/dev/ttyUSB*") if x not in ("/dev/ttyUSB0", "/dev/ttyUSB1"))
+        if p: return p[0]
+        time.sleep(0.25)
+    raise SystemExit("radio serial port not found")
+
 FS, SPS = 48000, 40                                   # 1200 Bd
 TONES = np.array([600, 1200, 1800, 2400])
 FMT = d.FORMATS[os.environ.get("DVFMT", "v3")]      # air format (dvframe.py); DVFMT=v2 for old recordings
@@ -134,7 +144,7 @@ def over(secs, key=True):
     th = threading.Thread(target=lambda: res.__setitem__("x", rig.record(secs + 4, wavp))); th.start()
     time.sleep(0.8)
     lines = []
-    with serial.Serial("/dev/ttyUSB2", 230400, timeout=0.5) as ser:
+    with serial.Serial(radio_port(), 230400, timeout=0.5) as ser:
         ser.reset_input_buffer()
         for c in [c for c in os.environ.get("DVCMD", "").split(";") if c]:   # e.g. DVCMD="X;X1,40,3800"
             ser.write(f"{c}\r".encode()); time.sleep(0.05)

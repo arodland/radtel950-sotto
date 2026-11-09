@@ -6,7 +6,7 @@ ARCH = -mcpu=cortex-m4 -mthumb -mfloat-abi=hard -mfpu=fpv4-sp-d16
 SOTTO_DEFS ?= -DFX_LAG=4 -DLR_AHEAD=0       # low-delay encoder (sotto docs/sotto-1200.md)
 CFLAGS = $(ARCH) -O2 $(SOTTO_DEFS) -ffunction-sections -fdata-sections -std=c11 -DHCLK_240 -DSOTTO_V36 -DSOTTO_PITCH_THIRD \
          -Wno-error=unterminated-string-initialization -I$(RT)/include -I$(SOTTO)/c -isystem $(SOTTO)/c/fixed/cm4/inc
-SRCS = main.c $(addprefix $(RT)/src/,startup.c system.c debug_uart.c drivers/gpio.c drivers/adc.c drivers/bk4829.c)
+SRCS = main.c $(addprefix $(RT)/src/,startup.c system.c debug_uart.c drivers/gpio.c drivers/adc.c drivers/bk4829.c drivers/spi.c)
 SOTTO_SRCS = $(addprefix $(SOTTO)/c/fixed/,fx_math.c fx_tables.c sotto_fx_enc.c sotto_fx_dec.c sotto_fx_lr_enc.c sotto_fx_lr.c)
 SOTTO_OBJS = $(notdir $(SOTTO_SRCS:.c=.o))
 
