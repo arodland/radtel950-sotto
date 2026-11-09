@@ -18,7 +18,7 @@ dvtx.bin: dvtx.elf
 	clang --target=thumbv7em-none-eabihf -mfloat-abi=hard -mfpu=fpv4-sp-d16 $(filter-out -O2 -Wno-error%,$(CFLAGS)) -O2 -c -o $@ $<
 shim.o: shim.c                    # must not turn back into calls to itself (memset -> memset)
 	$(CC) $(CFLAGS) -ffreestanding -fno-builtin -fno-tree-loop-distribute-patterns -c -o $@ $<
-dvtx.elf: $(SRCS) eq_coef.h dyn.h shim.o $(SOTTO_OBJS)
+dvtx.elf: $(SRCS) eq_coef.h dyn.h dvtables.h shim.o $(SOTTO_OBJS)
 	$(CC) $(CFLAGS) -T$(RT)/linker.ld -Wl,--gc-sections -nostdlib -o $@ $(SRCS) shim.o $(SOTTO_OBJS) -lgcc
 	arm-none-eabi-size $@
 clean:

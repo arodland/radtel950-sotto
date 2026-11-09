@@ -12,7 +12,8 @@ import dvframe as d
 
 FS, SPS = 48000, 40                                   # 1200 Bd
 TONES = np.array([600, 1200, 1800, 2400])
-FRAME = d.FRAME_SYMS * SPS
+FMT = d.FORMATS[os.environ.get("DVFMT", "v3")]      # air format (dvframe.py); DVFMT=v2 for old recordings
+FRAME = FMT.FRAME_SYMS * SPS
 DEC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sotto_dec_fx_d1")   # LR_INTERP=0: 1 superframe of delay
 import tempfile
 SCRATCH = os.path.join(tempfile.gettempdir(), "dvtx")   # recordings, logs, intermediate bitstreams
@@ -59,7 +60,7 @@ def grid(P, starts):
         b, a = np.polyfit(i[keep], starts[keep], 1)
         res = starts - (a + b * i); keep = np.abs(res) < max(8, 3 * np.median(np.abs(res[keep])))
     def q(t):
-        M = P[t + np.arange(d.FRAME_SYMS) * SPS]; srt = np.sort(M, 1)
+        M = P[t + np.arange(FMT.FRAME_SYMS) * SPS]; srt = np.sort(M, 1)
         return np.mean(srt[:, -1] / (srt[:, -2] + 1e-9))
     out = []
     for k in i:
@@ -82,7 +83,7 @@ def isi_metrics(F, mu):
     return -(al + be)
 
 def frame_feats(P, t):
-    M = P[t + np.arange(d.FRAME_SYMS) * SPS]
+    M = P[t + np.arange(FMT.FRAME_SYMS) * SPS]
     return M / np.median(M.max(1))
 
 def decode(x):
@@ -94,8 +95,8 @@ def decode(x):
     if len(starts) < 3: return [], starts, s, [1.0]
     starts = [t for t in grid(P, starts) if t + FRAME <= len(P)]
     feats = [frame_feats(P, t) for t in starts]
-    bits1 = [d.frame_decode(F[d.SYNC_LEN:]) for F in feats]
-    syms = [d.frame_symbols(b) for b in bits1]
+    bits1 = [FMT.frame_decode(F[d.SYNC_LEN:]) for F in feats]
+    syms = [FMT.frame_symbols(b) for b in bits1]
     F_all = np.concatenate(feats); T = np.concatenate(syms); prev = np.r_[T[0], T[:-1]]
     mu = np.zeros((4, 4, 4))
     for a in range(4):
@@ -105,9 +106,9 @@ def decode(x):
     out, sers = [], []
     for F in feats:
         met = isi_metrics(F, mu)[d.SYNC_LEN:]
-        bits = d.frame_decode(met / (np.std(met) + 1e-9))
+        bits = FMT.frame_decode(met / (np.std(met) + 1e-9))
         out.append(np.packbits(bits).tobytes())
-        sers.append(np.mean(met.argmax(1) != d.frame_symbols(bits)[d.SYNC_LEN:]))
+        sers.append(np.mean(met.argmax(1) != FMT.frame_symbols(bits)[d.SYNC_LEN:]))
     return out, starts, s, sers
 
 def parse_log(lines):
@@ -116,7 +117,7 @@ def parse_log(lines):
         p = ln.split()
         if len(p) >= 4 and p[0] == "S": sf[(int(p[1]), int(p[2]))] = bytes.fromhex(p[3])
     n = max(f for f, _ in sf) + 1 if sf else 0
-    return [b"".join(sf.get((f, k), bytes(6)) for k in range(d.SF_PER_FRAME)) for f in range(n)]
+    return [b"".join(sf.get((f, k), bytes(6)) for k in range(FMT.SF_PER_FRAME)) for f in range(n)]
 
 def sotto_wav(payload, name):
     bit = f"{SCRATCH}/{name}.bit"; raw = f"{SCRATCH}/{name}.raw"

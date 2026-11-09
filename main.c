@@ -33,16 +33,9 @@ int sotto_lr_enc_pop(struct sotto_lr_enc *e, unsigned char out[SOTTO_BYTES_PER_F
 
 /* ------------------------------------------------------------------ frame format */
 #define MIN_PRE_SYMS 240                   /* 200 ms of 0/3 filler at least before frame 0 */
-#define FIRST_READY 150                    /* measured: 147 (40 ms audio + 70 ms encoder + start-up) */
+#define FIRST_READY 198                    /* V2 measured 147 (40 ms audio + 70 ms encoder + start-up); + 48 for the 2nd superframe */
 #define JITTER_SYMS 12                     /* 10 ms of slack: 40 ms was never touched */
-#define SYNC_LEN 4
-#define FRAME_SYMS 48                      /* 40 ms */
-#define DATA_SYMS (FRAME_SYMS - SYNC_LEN)   /* 44 */
-#define SF_PER_FRAME 1
-#define INFO 48
-#define CODED (2 * (INFO + 6))              /* 108 */
-#define NPUNC (CODED - 2 * DATA_SYMS)       /* 20 */
-static const uint8_t sync_bits[SYNC_LEN] = {1,0,0,1};   /* 0 against the 0/3 preamble */
+#include "dvtables.h"                       /* V3: 80 ms frames, 2 superframes, unequal protection */
 static const uint8_t gray[4] = {0, 1, 3, 2};          /* dibit (b0 b1) as 2 b0 + b1 -> tone */
 
 /* ------------------------------------------------------------------ UART */
@@ -236,30 +229,20 @@ static void symbols_start(int on)
 static void push_sym(uint8_t t) { yring[y_head % YRING] = t; y_head++; }
 
 /* ------------------------------------------------------------------ FEC + framing */
-static uint8_t keep[CODED];
-static uint16_t ilv[2 * DATA_SYMS];
-
-static void fec_init(void)
-{
-    for (int i = 0; i < CODED; i++) keep[i] = (uint8_t)((i * NPUNC) % CODED >= NPUNC);
-    for (int k = 0; k < 2 * DATA_SYMS; k++) ilv[k] = (uint16_t)((k % 8) * 11 + k / 8);
-}
-
-static int parity7(uint32_t x) { return __builtin_parity(x & 0x7F); }
-
+static int parity7(uint32_t x) { x ^= x >> 4; x ^= x >> 2; x ^= x >> 1; return (int)(x & 1); }
+static void fec_init(void) { }
 static void push_frame(const uint8_t payload[INFO / 8])
 {
-    static uint8_t coded[CODED], kept[2 * DATA_SYMS], il[2 * DATA_SYMS];
+    static uint8_t coded[CODED], il[KEPT];
     uint32_t s = 0; int n = 0;
     for (int i = 0; i < INFO + 6; i++) {
-        int b = i < INFO ? (payload[i >> 3] >> (7 - (i & 7))) & 1 : 0;
+        int b = 0;
+        if (i < INFO) { int p = fmt_order[i]; b = (payload[p >> 3] >> (7 - (p & 7))) & 1; }
         s = ((s << 1) | (uint32_t)b) & 0x7F;
         coded[n++] = (uint8_t)parity7(s & 0133);
         coded[n++] = (uint8_t)parity7(s & 0171);
     }
-    n = 0;
-    for (int i = 0; i < CODED; i++) if (keep[i]) kept[n++] = coded[i];
-    for (int k = 0; k < 2 * DATA_SYMS; k++) il[ilv[k]] = kept[k];
+    for (int k = 0; k < KEPT; k++) il[fmt_ilv[k]] = coded[fmt_kept[k]];
     for (int i = 0; i < SYNC_LEN; i++) push_sym((uint8_t)(sync_bits[i] * 3));
     for (int i = 0; i < DATA_SYMS; i++) push_sym(gray[2 * il[2 * i] + il[2 * i + 1]]);
 }
