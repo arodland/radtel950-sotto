@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Live dvtx receiver: IC-9700 USB audio in, decoded speech out on the default audio device.
-usage: dv_live.py [--src PIPEWIRE_SOURCE] [--wav OUT.wav]
+usage: dv_live.py [--src PIPEWIRE_SOURCE] [--wav OUT.wav] [--hold N] [--replay AIR.wav]
 Locks on 3 consecutive syncs a frame apart, decodes each 40 ms frame (tone-pair trellis
-metrics as dv_rx.py, templates adapted as frames decode), plays it, and drops lock after 3 bad
-frames in a row (end of the over). Bad frames go to the decoder as lost (it conceals them)."""
+metrics as dv_rx.py, templates adapted as frames decode), plays it, and drops lock after N bad
+frames in a row (--hold, default 12: a fade is bridged on the radio's steady symbol clock). Bad frames go to the decoder as lost (it conceals them)."""
 import argparse, ctypes, os, subprocess, sys, time, wave
 import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -14,7 +14,7 @@ from dv_rx import FS, SPS, TONES, FRAME, isi_metrics
 SRC = "alsa_input.usb-Burr-Brown_from_TI_USB_Audio_CODEC-00.analog-stereo"
 CHUNK = 960                            # 20 ms reads
 KEEP = 3 * FS                          # samples of history kept
-LOCK_SCORE, BAD_SER, BAD_RUN = 0.4, 0.2, 3
+LOCK_SCORE, BAD_SER, BAD_RUN = 0.4, 0.15, 12   # BAD_SER: noise frames score 0.2-0.35, ~7% under 0.2; BAD_RUN: frames held through a fade (0.48 s)
 
 class Decoder:
     def __init__(self):
@@ -33,12 +33,12 @@ class Decoder:
         return res
 
 class Rx:
-    def __init__(self, play):
+    def __init__(self, play, hold=BAD_RUN, clock=time.time):
         n = np.arange(SPS)
         self.kern = np.exp(2j * np.pi * np.outer(TONES, n) / FS)[:, ::-1]
         self.x = np.zeros(0); self.P = np.zeros((0, 4)); self.off = 0     # absolute index of x[0]
         self.mu = np.load(os.path.join(HERE, "mu_init.npy"))
-        self.dec = Decoder(); self.play = play
+        self.dec = Decoder(); self.play = play; self.hold = hold; self.clock = clock
         self.locked = False; self.t = 0; self.bad = 0; self.searched = 0
         self.n = self.nbad = 0; self.sers = []
 
@@ -83,22 +83,28 @@ class Rx:
             if ok:
                 self.locked, self.t, self.bad = True, self.off + t, 0
                 self.n = self.nbad = 0; self.sers = []; self.t0 = time.time()
-                print(f"over: locked", flush=True)
+                print(f"{self.stamp()} over: locked", flush=True)
                 return True
         return False
 
+    def frame_at(self, r):                                 # decode the frame at relative start r
+        F = self.P[r + np.arange(d.FRAME_SYMS) * SPS]; F = F / (np.median(F.max(1)) + 1e-9)
+        met = isi_metrics(F, self.mu)
+        bits = d.frame_decode(met[d.SYNC_LEN:] / (np.std(met) + 1e-9))
+        syms = d.frame_symbols(bits)
+        return np.mean(met.argmax(1) != syms), F, bits, syms
+
     def track(self):
         while self.t - self.off + FRAME + 4 + SPS <= len(self.P):
-            r = self.t - self.off
+            r0 = self.t - self.off
             def q(u):
                 M = self.P[u + np.arange(d.FRAME_SYMS) * SPS]; srt = np.sort(M, 1)
                 return np.mean(srt[:, -1] / (srt[:, -2] + 1e-9)) + 2 * self.sync(u, u + 1)[0]
-            r = max(range(max(r - 2, 0), r + 3), key=q)
-            F = self.at(self.off + r)
-            met = isi_metrics(F, self.mu)
-            bits = d.frame_decode(met[d.SYNC_LEN:] / (np.std(met) + 1e-9))
-            syms = d.frame_symbols(bits)
-            ser = np.mean(met.argmax(1) != syms)
+            r = max(range(max(r0 - 2, 0), r0 + 3), key=q)
+            ser, F, bits, syms = self.frame_at(r)
+            if ser >= BAD_SER and r != r0:                     # flywheel: in a fade the retiming
+                alt = self.frame_at(r0)                         # chases noise; the radio's symbol
+                if alt[0] < ser: r, (ser, F, bits, syms) = r0, alt   # clock doesn't drift
             good = ser < BAD_SER
             if good:                                       # adapt the tone-pair templates
                 prev = np.r_[syms[0], syms[:-1]]
@@ -107,17 +113,33 @@ class Rx:
             self.n += 1; self.nbad += not good; self.sers.append(ser)
             self.bad = 0 if good else self.bad + 1
             self.t = self.off + r + FRAME
-            if self.bad >= BAD_RUN:
+            if self.bad >= self.hold:
                 for y in self.dec.flush(): self.play(y)
-                print(f"over: end, {self.n - BAD_RUN} frames ({(self.n - BAD_RUN) * 0.04:.1f} s), "
-                      f"{self.nbad - BAD_RUN} bad, raw SER {np.mean(self.sers[:-BAD_RUN] or [0]):.4f}", flush=True)
+                n = self.n - self.hold
+                print(f"{self.stamp()} over: end, {n} frames ({n * 0.04:.1f} s), "
+                      f"{self.nbad - self.hold} bad, raw SER {np.mean(self.sers[:-self.hold] or [0]):.4f}", flush=True)
                 self.locked = False; self.searched = self.t - self.off
                 return True
         return True
 
+    def stamp(self): return time.strftime("%H:%M:%S", time.localtime(self.clock()))
+
 def main():
     ap = argparse.ArgumentParser(); ap.add_argument("--src", default=SRC); ap.add_argument("--wav")
+    ap.add_argument("--hold", type=int, default=BAD_RUN, help="bad frames in a row before dropping lock")
+    ap.add_argument("--replay", metavar="AIR.wav", help="decode a recording (48 kHz) instead, no playback; "
+                    "AIR_start.txt beside it (unix time of sample 0) gives the timestamps")
     a = ap.parse_args()
+    if a.replay:
+        w = wave.open(a.replay); st = os.path.splitext(a.replay)[0] + "_start.txt"
+        t0 = float(open(st).read()) if os.path.exists(st) else 0.0
+        wf = None
+        if a.wav:
+            wf = wave.open(a.wav, "wb"); wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(8000)
+        rx = Rx(lambda y: wf and wf.writeframes(y.tobytes()), a.hold, lambda: t0 + (rx.off + len(rx.x)) / FS)
+        while b := w.readframes(CHUNK): rx.feed(np.frombuffer(b, np.int16).astype(float))
+        if wf: wf.close()
+        return
     rec = subprocess.Popen(["pw-record", f"--target={a.src}", "--rate=48000", "--channels=1", "--format=s16",
                             "--raw", "-"], stdout=subprocess.PIPE)
     out = subprocess.Popen(["pw-play", "--rate=8000", "--channels=1", "--format=s16", "--raw",
