@@ -138,7 +138,7 @@ static const bkw_t tx_setup[] = {           /* chip 1: 432.950 MHz (same crystal
 };
 
 static const bkw_t fm_setup[] = {           /* chip 1: FM voice at the same frequency and power (PTT2) */
-    TX_START(1), {1,0x38,0xA108}, {1,0x39,0x0294}, {1,0x2C,0x0022}, {1,0x7D,0xE91A}, {1,0x48,0xB3FF},   /* mic gain 0x1A (chip default 0x12 was a bit low; 0x1F max) */
+    TX_START(1), {1,0x38,0xA108}, {1,0x39,0x0294}, {1,0x2C,0x003F}, {1,0x7D,0xE91A}, {1,0x48,0xB3FF},   /* mic boost max (+30 dB; the chip default 0x22 left FM ~26 dB under the DV tones, fm_cal.py), gain 0x1A */
     {1,0x36,0x8E79}, {1,0x47,0x6656}, {1,0x30,0x0200}, {1,0x30,0xC1FE},
 };
 
@@ -419,15 +419,18 @@ static void transmit(uint32_t secs)
     out_s(" pcm_overruns="); out_u(s_overrun); out_s(" pre_filler="); out_u(pre); out_s(" fill_min_before_push="); out_u(fill_min); out_s("\r\nDONE\r\n");
 }
 
-/* PTT2: plain FM voice (stock TX path, mic at the chip's defaults) at the same power, until released */
-static void transmit_fm(void)
+/* PTT2: plain FM voice (stock TX path) at the same power, until released; secs > 0: a timed
+   over (serial F command). The X overrides apply here too, for deviation tests. */
+static void transmit_fm(uint32_t secs)
 {
     if (rx_on) rx_stop();
     led(0, 1); bk4829_bb_loops = 155;
     pa_route(1); DAC->DHR12R2 = apc;
     bk_apply(fm_setup, (int)(sizeof fm_setup / sizeof fm_setup[0]));
+    bk_apply(ovr, n_ovr);
     uint32_t up = 0, t0 = get_tick();
-    while (up < 20 && get_tick() - t0 < 180000) {     /* 20 ms release debounce, 180 s timeout */
+    if (secs) while (get_tick() - t0 < secs * 1000) { housekeeping(); delay_ms(1); }
+    else while (up < 20 && get_tick() - t0 < 180000) {   /* 20 ms release debounce, 180 s timeout */
         housekeeping(); delay_ms(1);
         up = ptt2_down() ? 0 : up + 1;
     }
@@ -515,7 +518,7 @@ int main(void)
 #endif
         if (ptt_down()) {                   /* 20 ms held: PTT1 = DV, PTT2 = FM voice */
             delay_ms(1);
-            if (++down_ms >= 20) { if (ptt1_down()) transmit(0); else if (ptt2_down()) transmit_fm(); down_ms = 0; }
+            if (++down_ms >= 20) { if (ptt1_down()) transmit(0); else if (ptt2_down()) transmit_fm(0); down_ms = 0; }
             continue;
         }
         down_ms = 0;
@@ -593,6 +596,11 @@ int main(void)
             }
             uint8_t e[32]; spi_flash_read(0x00F230, e, 32);
             out_s("EDGES"); for (int i = 0; i < 32; i++) { out_s(" "); out_u(e[i]); } out_s("\r\n");
+        }
+        else if (line[0] == 'F') {                 /* F<secs>: timed FM over (max 60) */
+            uint32_t secs = 0;
+            for (const char *q = line + 1; *q >= '0' && *q <= '9'; q++) secs = secs * 10 + (uint32_t)(*q - '0');
+            transmit_fm(secs < 1 ? 1 : secs > 60 ? 60 : secs);
         }
         else if (line[0] == 'T') {
             uint32_t secs = 0;
