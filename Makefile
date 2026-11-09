@@ -6,7 +6,7 @@ ARCH = -mcpu=cortex-m4 -mthumb -mfloat-abi=hard -mfpu=fpv4-sp-d16
 SOTTO_DEFS ?= -DFX_LAG=4 -DLR_AHEAD=0       # low-delay encoder (sotto docs/sotto-1200.md)
 CFLAGS = $(ARCH) -O2 $(SOTTO_DEFS) -ffunction-sections -fdata-sections -std=c11 -DHCLK_240 -DSOTTO_V36 -DSOTTO_PITCH_THIRD \
          -Wno-error=unterminated-string-initialization -I$(RT)/include -I$(SOTTO)/c -isystem $(SOTTO)/c/fixed/cm4/inc
-SRCS = main.c $(addprefix $(RT)/src/,startup.c system.c debug_uart.c drivers/gpio.c drivers/adc.c drivers/bk4829.c drivers/spi.c)
+SRCS = main.c $(addprefix $(RT)/src/,startup.c system.c debug_uart.c drivers/gpio.c drivers/adc.c drivers/bk4829.c drivers/spi.c app/encoder.c)
 SOTTO_SRCS = $(addprefix $(SOTTO)/c/fixed/,fx_math.c fx_tables.c sotto_fx_enc.c sotto_fx_dec.c sotto_fx_lr_enc.c sotto_fx_lr.c)
 SOTTO_OBJS = $(notdir $(SOTTO_SRCS:.c=.o))
 
@@ -24,10 +24,10 @@ dvtx.elf: $(SRCS) eq_coef.h dyn.h dvtables.h shim.o $(SOTTO_OBJS)
 clean:
 	rm -f dvtx.elf dvtx.bin dvtx.BTF *.o libsottodec.so sotto_dec_fx_d1
 
-# the receiver's decoder (x86 shared library for dv_live.py): fixed sotto 1200, LR_INTERP=0 so it
-# plays superframe s as soon as s + 1 is in (1 superframe of delay; frames are lost whole anyway)
+# the receiver's decoder (x86 shared library for dv_live.py): fixed sotto 1200, LR_INTERP=1: one more
+# superframe of delay (40 ms) so a lone lost superframe is rebuilt from its neighbours
 FX_DEC = $(addprefix $(SOTTO)/c/fixed/,sotto_fx_lr.c sotto_fx_dec.c fx_math.c fx_tables.c)
-DEC_DEFS = -DSOTTO_V36 -DSOTTO_PITCH_THIRD -DLR_INTERP=0 -DSOTTO_LR_DEC_DELAY=1
+DEC_DEFS = -DSOTTO_V36 -DSOTTO_PITCH_THIRD -DLR_INTERP=1 -DSOTTO_LR_DEC_DELAY=2
 libsottodec.so: $(FX_DEC)
 	cc -O2 -shared -fPIC -std=c99 $(DEC_DEFS) -I$(SOTTO)/c -o $@ $(FX_DEC)
 # the same decoder as a file-to-file tool, for dv_rx.py

@@ -25,6 +25,7 @@
 #include "eq_coef.h"
 #include "dyn.h"
 #include "drivers/spi.h"
+#include "app/encoder.h"
 
 extern void delay_ms(uint32_t ms);
 extern volatile uint32_t bk4829_bb_loops;
@@ -34,9 +35,9 @@ int sotto_lr_enc_pop(struct sotto_lr_enc *e, unsigned char out[SOTTO_BYTES_PER_F
 
 /* ------------------------------------------------------------------ frame format */
 #define MIN_PRE_SYMS 240                   /* 200 ms of 0/3 filler at least before frame 0 */
-#define FIRST_READY 198                    /* V2 measured 147 (40 ms audio + 70 ms encoder + start-up); + 48 for the 2nd superframe */
+#define FIRST_READY 150                    /* measured: 147 (40 ms audio + 70 ms encoder + start-up); V3 (2 superframes) needs 198 */
 #define JITTER_SYMS 12                     /* 10 ms of slack: 40 ms was never touched */
-#include "dvtables.h"                       /* V3: 80 ms frames, 2 superframes, unequal protection */
+#include "dvtables.h"                       /* air format tables from dvframe.py (gen_tables.py) */
 static const uint8_t gray[4] = {0, 1, 3, 2};          /* dibit (b0 b1) as 2 b0 + b1 -> tone */
 
 /* ------------------------------------------------------------------ UART */
@@ -150,6 +151,63 @@ static void pa_route(int on)                /* nicFW's UHF TX route; APC (DAC2) 
     gpio_clear_pin(GPIOE, GPIO_PIN_14); gpio_config_pin(GPIOE, GPIO_PIN_14, GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
     if (on) gpio_set_pin(GPIOE, GPIO_PIN_7); else gpio_clear_pin(GPIOE, GPIO_PIN_7);
     gpio_config_pin(GPIOE, GPIO_PIN_7, GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
+}
+
+/* ------------------------------------------------------------------ FM receive (idle) */
+/* Chip 1 receives on the TX frequency and drives the speaker: stock RX (REG_30 BFF1, REG_47
+   FB67), volume in REG_48 bits 9:4 from the top knob's encoder (PB4/PB5), the BK's squelch
+   (REG_4D/4E/4F/78; REG_0C bit 1 = open) gating the speaker mute (PE1). PB8 and PE4 are the speaker
+   amplifier enables; low selects the internal mic, so it flips at key-up. */
+static int rx_on, rx_vol = 10, rx_sql = 4;         /* volume 0-15, squelch 0-9 (0 = open) */
+static uint32_t rx_poll_t; static int rx_open; static uint16_t rx_rssi;
+static void rx_set_volume(void)
+{
+    uint16_t g = (uint16_t)((rx_vol * 63 + 7) / 15);
+    bk4829_write_reg(1, 0x48, (uint16_t)(0xB00F | (g << 4)));
+}
+static void rx_set_squelch(void)
+{
+    static const uint8_t thr[9] = {10, 15, 20, 25, 30, 40, 50, 75, 100};
+    if (!rx_sql) { bk4829_write_reg(1, 0x4D, 0xA000); bk4829_write_reg(1, 0x4E, 0x6F00); bk4829_write_reg(1, 0x4F, 0); bk4829_write_reg(1, 0x78, 0); return; }
+    uint8_t o = thr[rx_sql - 1], c = (uint8_t)(o > 5 ? o - 5 : 0);
+    bk4829_write_reg(1, 0x4D, 0xA020); bk4829_write_reg(1, 0x4E, 0x6F30);
+    bk4829_write_reg(1, 0x4F, (uint16_t)(((o / 2) << 8) | (c / 2)));
+    bk4829_write_reg(1, 0x78, (uint16_t)((o << 8) | c));
+}
+static void rx_start(void)
+{
+    bk4829_bb_loops = 155;
+    bk4829_write_reg(1, 0x38, 0xA108); bk4829_write_reg(1, 0x39, 0x0294);
+    bk4829_write_reg(1, 0x30, 0x0200); delay_ms(2);
+    bk4829_write_reg(1, 0x30, 0xBFF1); bk4829_write_reg(1, 0x47, 0xFB67);
+    rx_set_volume(); rx_set_squelch();
+    gpio_set_pin(GPIOC, GPIO_PIN_12);                       /* speaker from the BK, not the MCU DAC */
+    gpio_set_pin(GPIOB, GPIO_PIN_8);                        /* amplifier on */
+    gpio_set_pin(GPIOE, GPIO_PIN_4);                        /* speaker enable (needed: no audio with it low) */
+    rx_on = 1;
+}
+static void rx_stop(void)
+{
+    gpio_set_pin(GPIOE, GPIO_PIN_1);                        /* mute */
+    gpio_clear_pin(GPIOE, GPIO_PIN_4);
+    gpio_clear_pin(GPIOB, GPIO_PIN_8);                      /* internal mic */
+    bk4829_write_reg(1, 0x30, 0);
+    rx_on = 0;
+}
+static void rx_poll(void)                                   /* from the idle loop */
+{
+    int8_t d = encoder_poll();
+    if (d) { rx_vol += d; if (rx_vol < 0) rx_vol = 0; if (rx_vol > 15) rx_vol = 15; rx_set_volume(); out_s("VOL "); out_u((uint32_t)rx_vol); out_s("\r\n"); }
+    if (get_tick() - rx_poll_t < 20) return;
+    rx_poll_t = get_tick();
+    /* software squelch on RSSI (REG_67 bits 8:0, ~0.5 dB units) with hysteresis; the BK's own
+       squelch flag (REG_0C bit 1) never opened for us */
+    static const uint16_t sq_open[9] = {40, 50, 60, 70, 80, 95, 110, 130, 150};
+    uint16_t rssi = bk4829_read_reg(1, 0x67) & 0x1FF; rx_rssi = rssi;
+    if (!rx_sql) rx_open = 1;
+    else if (rssi >= sq_open[rx_sql - 1]) rx_open = 1;
+    else if (rssi + 6 < sq_open[rx_sql - 1]) rx_open = 0;
+    if (rx_open) gpio_clear_pin(GPIOE, GPIO_PIN_1); else gpio_set_pin(GPIOE, GPIO_PIN_1);
 }
 
 static bkw_t ovr[8]; static int n_ovr;
@@ -294,6 +352,7 @@ static void transmit(uint32_t secs)
     /* key up: route + chip 1 TX + tone generator; chip 0 already capturing */
     s_head = s_tail = s_overrun = 0; dc_q8 = 1220 << 8; y_head = y_tail = y_underrun = 0; y_last = 3;
     bk4829_bb_loops = 155;                  /* setup at the proven read speed; 4 lost writes */
+    if (rx_on) rx_stop();
     led(1, 0); pa_route(1); DAC->DHR12R2 = apc;
     bk_apply(tx_setup, (int)(sizeof tx_setup / sizeof tx_setup[0]));
     bk_apply(ovr, n_ovr);
@@ -353,6 +412,7 @@ static void transmit(uint32_t secs)
     bk4829_write_reg(1, 0x70, 0); bk4829_write_reg(1, 0x30, 0);
     pa_route(0); DAC->DHR12R2 = 0; led(0, 0);
     sotto_lr_enc_destroy(e);
+    rx_start();
     out_s("STAT frames="); out_u(frames); out_s(" superframes="); out_u(nsf);
     out_s(" enc10ms_mean_cyc="); out_u(nenc ? (uint32_t)(enc_sum / nenc) : 0); out_s(" enc_max_cyc="); out_u(enc_max);
     out_s(" sym_underruns="); out_u(y_underrun); out_s(" sym_fill_max="); out_u(fill_max);
@@ -362,6 +422,7 @@ static void transmit(uint32_t secs)
 /* PTT2: plain FM voice (stock TX path, mic at the chip's defaults) at the same power, until released */
 static void transmit_fm(void)
 {
+    if (rx_on) rx_stop();
     led(0, 1); bk4829_bb_loops = 155;
     pa_route(1); DAC->DHR12R2 = apc;
     bk_apply(fm_setup, (int)(sizeof fm_setup / sizeof fm_setup[0]));
@@ -373,6 +434,7 @@ static void transmit_fm(void)
     bk4829_write_reg(1, 0x30, 0); bk4829_write_reg(1, 0x36, 0);
     pa_route(0); DAC->DHR12R2 = 0; led(0, 0);
     out_s("FM over\r\n");
+    rx_start();
 }
 
 int main(void)
@@ -423,14 +485,16 @@ int main(void)
     fec_init();
     bk_apply(mic_setup, (int)(sizeof mic_setup / sizeof mic_setup[0]));
 
+    gpio_config_pin(GPIOC, GPIO_PIN_12, GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP); encoder_init();
     out_s("\r\ndvtx ready\r\n");
     char line[20];
     gpio_config_pin(GPIOE, GPIO_PIN_3, GPIO_MODE_INPUT, GPIO_CNF_PULL); gpio_set_pin(GPIOE, GPIO_PIN_3);  /* PTT1 */
     gpio_config_pin(GPIOE, GPIO_PIN_2, GPIO_MODE_INPUT, GPIO_CNF_PULL); gpio_set_pin(GPIOE, GPIO_PIN_2);  /* PTT2 */
     led(0, 0); gpio_config_pin(GPIOC, GPIO_PIN_13, GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP); gpio_config_pin(GPIOC, GPIO_PIN_14, GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
     uint32_t down_ms = 0;
+    rx_start();
     for (;;) {
-        housekeeping();
+        housekeeping(); if (rx_on) rx_poll();
 #ifdef KNOB_PROBE
         {   /* PE0 read three ways, 5 times a second */
             static uint32_t last;
@@ -504,6 +568,16 @@ int main(void)
             }
             capture_start(0); raw_cap = 0;
             out_s("STAT pcm_overruns="); out_u(s_overrun); out_s("\r\nDONE\r\n");
+        }
+        else if (line[0] == 'V' || line[0] == 'Q') {   /* V<0-15> volume, Q<0-9> squelch (0 = open) */
+            int v = 0; for (const char *q = line + 1; *q >= '0' && *q <= '9'; q++) v = v * 10 + (*q - '0');
+            if (line[0] == 'V') { rx_vol = v > 15 ? 15 : v; if (rx_on) rx_set_volume(); }
+            else { rx_sql = v > 9 ? 9 : v; if (rx_on) rx_set_squelch(); }
+            out_s("ok\r\n");
+        }
+        else if (line[0] == 'I') {                 /* I: receiver status */
+            out_s("RX rssi="); out_u(rx_rssi); out_s(" reg0c="); out_u(bk4829_read_reg(1, 0x0C));
+            out_s(" open="); out_u((uint32_t)rx_open); out_s(" vol="); out_u((uint32_t)rx_vol); out_s(" sql="); out_u((uint32_t)rx_sql); out_s("\r\n");
         }
         else if (line[0] == 'A') {                 /* A<v>: APC DAC value for the next overs */
             uint32_t v = 0;

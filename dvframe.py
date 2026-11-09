@@ -11,11 +11,11 @@ Common
             g1 then g2 per input bit; punctured, interleaved, dibits -> symbols
   Payload   SF_PER_FRAME sotto 1200 superframes of 48 bits, MSB first
 
-V2 (40 ms frames, 1 superframe, 2026-11-09 walk test): 48 symbols = 4 sync + 44 data.
+V2 (40 ms frames, 1 superframe; current, chosen 2026-11-09 after walk 2 showed no V3 benefit): 48 symbols = 4 sync + 44 data.
   108 coded bits; coded bit i dropped when (i * 20) % 108 < 20 (20 bits, evenly spread) -> 88;
   interleave: bit k goes to position (k % 8) * 11 + k // 8.
 
-V3 (80 ms frames, 2 superframes, unequal error protection): 96 symbols = 4 sync + 92 data.
+V3 (80 ms frames, 2 superframes, unequal error protection; walk 2 only): 96 symbols = 4 sync + 92 data.
   The 96 payload bits are reordered so the two superframes' critical fields come first
   (voicing A, voicing B, energy A, energy B, pitch A, pitch B of superframe 0 then 1: 44 bits,
   the least damaging steps last) then the 52 shape bits (shape A stages 1, 2 and shape B).

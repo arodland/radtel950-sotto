@@ -22,7 +22,7 @@ def radio_port():
 
 FS, SPS = 48000, 40                                   # 1200 Bd
 TONES = np.array([600, 1200, 1800, 2400])
-FMT = d.FORMATS[os.environ.get("DVFMT", "v3")]      # air format (dvframe.py); DVFMT=v2 for old recordings
+FMT = d.FORMATS[os.environ.get("DVFMT", "v2")]      # air format (dvframe.py); DVFMT=v3 for walk 2
 FRAME = FMT.FRAME_SYMS * SPS
 DEC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sotto_dec_fx_d1")   # LR_INTERP=0: 1 superframe of delay
 import tempfile

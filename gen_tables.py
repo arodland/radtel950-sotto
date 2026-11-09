@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""dvtables.h: the V3 air format's tables for the firmware, from the reference (dvframe.py)."""
+"""dvtables.h: the current air format's tables for the firmware, from the reference (dvframe.py)."""
 import numpy as np, dvframe as d
-F = d.V3
+F = d.V2
 with open("dvtables.h", "w") as f:
     f.write(f"/* {F.name} framing tables (gen_tables.py from dvframe.py) */\n")
     f.write(f"#define SYNC_LEN {d.SYNC_LEN}\n#define FRAME_SYMS {F.FRAME_SYMS}\n#define DATA_SYMS {F.DATA_SYMS}\n")

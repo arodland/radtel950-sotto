@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Live dvtx receiver: IC-9700 USB audio in, decoded speech out on the default audio device.
-usage: [DVFMT=v2] dv_live.py [--src PIPEWIRE_SOURCE] [--wav OUT.wav] [--hold N] [--noncoh] [--replay AIR.wav]
+usage: dv_live.py [--src PIPEWIRE_SOURCE] [--wav OUT.wav] [--hold N] [--noncoh] [--parrot] [--smeter OUT.tsv] [--replay AIR.wav]
 Locks on 3 consecutive syncs a frame apart, decodes each frame coherently (coh.py: the air signal
 is continuous-phase 4-FSK; carrier phase carried from frame to frame, templates adapted as frames
 decode; --noncoh: Goertzel + tone-pair trellis as dv_rx.py), plays it, and drops lock after N bad
 frames in a row (--hold, default 12: a fade is bridged on the radio's steady symbol clock). Bad frames go to the decoder as lost (it conceals them)."""
-import argparse, ctypes, os, subprocess, sys, time, wave
+import argparse, ctypes, os, subprocess, sys, threading, time, wave
 import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -185,15 +185,60 @@ class Rx:
                       f"{self.nbad - self.hold} bad" + (f", {part} shape-only" if part else "") +
                       f", raw SER {np.mean(self.sers[:-self.hold] or [0]):.4f}", flush=True)
                 self.locked = False; self.searched = self.t - self.off
+                if getattr(self, 'on_over_end', None): self.on_over_end()
                 return True
         return True
 
     def stamp(self): return time.strftime("%H:%M:%S", time.localtime(self.clock()))
 
+class Civ:
+    """IC-9700 over CI-V (address 0xA2): S-meter reads and PTT. One owner per port."""
+    def __init__(self, port="/dev/ttyUSB0"):
+        import serial
+        self.s = serial.Serial(port, 19200, timeout=0.3); self.lock = threading.Lock()
+    def cmd(self, data):
+        pkt = bytes([0xFE, 0xFE, 0xA2, 0xE0]) + data + b"\xfd"
+        with self.lock:
+            self.s.reset_input_buffer(); self.s.write(pkt); b = self.s.read_until(b"\xfd", 64)
+            if b.endswith(pkt): b += self.s.read_until(b"\xfd", 64)
+        return b
+    def smeter(self):
+        b = self.cmd(bytes([0x15, 0x02])); i = b.find(bytes([0xFE, 0xFE, 0xE0, 0xA2, 0x15, 0x02]))
+        return int(f"{b[i + 6]:02x}{b[i + 7]:02x}") if i >= 0 and len(b) >= i + 9 else -1
+    def ptt(self, on): self.cmd(bytes([0x1C, 0x00, 1 if on else 0]))
+
+class Parrot:
+    """after each over, key the IC-9700 (CI-V PTT) and play the decoded speech into its USB audio
+    input (set the 9700's MOD input to USB). Overs shorter than MIN_S are ignored."""
+    SINK = "alsa_output.usb-Burr-Brown_from_TI_USB_Audio_CODEC-00.analog-stereo"
+    MIN_S, MAX_S = 1.0, 30.0
+    def __init__(self, civ, level=0.4): self.civ = civ; self.level = level; self.buf = []; self.busy = False
+    def audio(self, y): self.buf.append(y)
+    def over_end(self):
+        y = np.concatenate(self.buf) if self.buf else np.zeros(0, np.int16); self.buf = []
+        if len(y) < self.MIN_S * 8000 or self.busy: return
+        y = y[:int(self.MAX_S * 8000)]
+        threading.Thread(target=self.send, args=(y,), daemon=True).start()
+    def send(self, y):
+        self.busy = True
+        try:
+            self.civ.ptt(True); time.sleep(0.4)
+            from scipy.signal import resample_poly                    # PipeWire's own 8 -> 48 kHz
+            y48 = np.clip(resample_poly(y.astype(float), 6, 1) * self.level, -32767, 32767).astype(np.int16)   # path stuttered
+            subprocess.run(["pw-play", f"--target={self.SINK}", "--rate=48000", "--channels=1", "--format=s16",
+                            "--raw", "-"], input=y48.tobytes(), check=False)
+            time.sleep(0.3); self.civ.ptt(False)
+            print(f"{time.strftime('%H:%M:%S')} parrot: sent {len(y) / 8000:.1f} s", flush=True)
+        finally:
+            self.civ.ptt(False); self.busy = False
+
 def main():
     ap = argparse.ArgumentParser(); ap.add_argument("--src", default=SRC); ap.add_argument("--wav")
     ap.add_argument("--hold", type=int, default=BAD_RUN, help="bad frames in a row before dropping lock")
     ap.add_argument("--noncoh", action="store_true", help="noncoherent (Goertzel + tone-pair trellis) detection instead of coh.py")
+    ap.add_argument("--parrot", action="store_true", help="retransmit each over on the IC-9700 (CI-V PTT, USB audio)")
+    ap.add_argument("--smeter", metavar="OUT.tsv", help="log the IC-9700 S-meter every 0.5 s (unix time, raw)")
+    ap.add_argument("--parrot-level", type=float, default=0.3, help="parrot playback level into the 9700's USB input (0-1; 0.3 is clean)")
     ap.add_argument("--replay", metavar="AIR.wav", help="decode a recording (48 kHz) instead, no playback; "
                     "AIR_start.txt beside it (unix time of sample 0) gives the timestamps")
     a = ap.parse_args()
@@ -214,10 +259,22 @@ def main():
     wf = None
     if a.wav:
         wf = wave.open(a.wav, "wb"); wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(8000)
+    civ = Civ() if (a.parrot or a.smeter) else None
+    parrot = Parrot(civ, a.parrot_level) if a.parrot else None
     def play(y):
         out.stdin.write(y.tobytes()); out.stdin.flush()
         if wf: wf.writeframes(y.tobytes())
+        if parrot: parrot.audio(y)
     rx = Rx(play, a.hold, coherent=not a.noncoh)
+    if parrot: rx.on_over_end = parrot.over_end
+    if a.smeter:
+        def smeter_log():
+            with open(a.smeter, "a", buffering=1) as f:
+                while True:
+                    t = time.time(); v = civ.smeter()
+                    if v >= 0: f.write(f"{t:.2f}\t{v}\n")
+                    time.sleep(max(0, 0.5 - (time.time() - t)))
+        threading.Thread(target=smeter_log, daemon=True).start()
     print("listening", flush=True)
     try:
         while True:
