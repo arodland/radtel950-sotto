@@ -6,7 +6,7 @@ ARCH = -mcpu=cortex-m4 -mthumb -mfloat-abi=hard -mfpu=fpv4-sp-d16
 SOTTO_DEFS ?= -DFX_LAG=4 -DLR_AHEAD=0       # low-delay encoder (sotto docs/sotto-1200.md)
 CFLAGS = $(ARCH) -O2 $(SOTTO_DEFS) -ffunction-sections -fdata-sections -std=c11 -DHCLK_240 -DSOTTO_V36 -DSOTTO_PITCH_THIRD \
          -Wno-error=unterminated-string-initialization -I$(RT)/include -I$(SOTTO)/c -isystem $(SOTTO)/c/fixed/cm4/inc
-SRCS = main.c $(addprefix $(RT)/src/,startup.c system.c debug_uart.c drivers/gpio.c drivers/adc.c drivers/bk4829.c drivers/spi.c app/encoder.c)
+SRCS = main.c dvrx.c $(addprefix $(RT)/src/,startup.c system.c debug_uart.c drivers/gpio.c drivers/adc.c drivers/bk4829.c drivers/spi.c app/encoder.c)
 SOTTO_SRCS = $(addprefix $(SOTTO)/c/fixed/,fx_math.c fx_tables.c sotto_fx_enc.c sotto_fx_dec.c sotto_fx_lr_enc.c sotto_fx_lr.c)
 SOTTO_OBJS = $(notdir $(SOTTO_SRCS:.c=.o))
 
@@ -18,7 +18,7 @@ dvtx.bin: dvtx.elf
 	clang --target=thumbv7em-none-eabihf -mfloat-abi=hard -mfpu=fpv4-sp-d16 $(filter-out -O2 -Wno-error%,$(CFLAGS)) -O2 -c -o $@ $<
 shim.o: shim.c                    # must not turn back into calls to itself (memset -> memset)
 	$(CC) $(CFLAGS) -ffreestanding -fno-builtin -fno-tree-loop-distribute-patterns -c -o $@ $<
-dvtx.elf: $(SRCS) eq_coef.h dyn.h dvtables.h shim.o $(SOTTO_OBJS)
+dvtx.elf: $(SRCS) eq_coef.h dyn.h dvtables.h dvrx.h dvrx_tables.h shim.o $(SOTTO_OBJS)
 	$(CC) $(CFLAGS) -T$(RT)/linker.ld -Wl,--gc-sections -nostdlib -o $@ $(SRCS) shim.o $(SOTTO_OBJS) -lgcc
 	arm-none-eabi-size $@
 clean:
@@ -37,3 +37,6 @@ sotto_dec_fx_d1: $(FX_DEC) $(SOTTO)/c/sotto_dec.c
 sotto_enc_fx_lo: $(addprefix $(SOTTO)/c/fixed/,sotto_fx_enc.c sotto_fx_lr_enc.c fx_math.c fx_tables.c) $(SOTTO)/c/sotto_enc.c
 	cc -O2 -std=c99 -DSOTTO_V36 -DSOTTO_PITCH_THIRD $(SOTTO_DEFS) -I$(SOTTO)/c -o $@ $^
 receiver: libsottodec.so sotto_dec_fx_d1 sotto_enc_fx_lo
+# the C receiver on the PC (dvrx_host IN.raw [T0] [OUT]: 19.2 kHz int16 in)
+dvrx_host: dvrx_host.c dvrx.c dvrx.h dvrx_tables.h dvtables.h
+	cc -O2 -Wall -Wextra -std=c11 -o $@ dvrx_host.c dvrx.c -lm

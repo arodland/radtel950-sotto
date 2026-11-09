@@ -26,6 +26,7 @@
 #include "dyn.h"
 #include "drivers/spi.h"
 #include "app/encoder.h"
+#include "dvrx.h"
 
 extern void delay_ms(uint32_t ms);
 extern volatile uint32_t bk4829_bb_loops;
@@ -158,10 +159,15 @@ static void pa_route(int on)                /* nicFW's UHF TX route; APC (DAC2) 
    FB67), volume in REG_48 bits 9:4 from the top knob's encoder (PB4/PB5), the BK's squelch
    (REG_4D/4E/4F/78; REG_0C bit 1 = open) gating the speaker mute (PE1). PB8 and PE4 are the speaker
    amplifier enables; low selects the internal mic, so it flips at key-up. */
-static int rx_on, rx_vol = 10, rx_sql = 4;         /* volume 0-15, squelch 0-9 (0 = open) */
+static uint16_t dv_gain = 256;              /* DV speaker gain, Q8, from the volume knob */
+static int dv_active;                       /* DV over being played through the DAC */
+static int rx_on, rx_vol = 7, rx_sql = 4;          /* FM level 0-15 (7 matches the DV playback by ear), squelch 0-9 (0 = open) */
 static uint32_t rx_poll_t; static int rx_open; static uint16_t rx_rssi;
 static void rx_set_volume(void)
 {
+    static const uint16_t dg[16] = {0, 8, 11, 16, 23, 32, 45, 64, 91, 128, 181, 256, 362, 512, 724, 1024};
+    dv_gain = dg[rx_vol];
+    if (dv_active) return;                                  /* the BK stays turned down while DV plays */
     uint16_t g = (uint16_t)((rx_vol * 63 + 7) / 15);
     bk4829_write_reg(1, 0x48, (uint16_t)(0xB00F | (g << 4)));
 }
@@ -174,6 +180,8 @@ static void rx_set_squelch(void)
     bk4829_write_reg(1, 0x4F, (uint16_t)(((o / 2) << 8) | (c / 2)));
     bk4829_write_reg(1, 0x78, (uint16_t)((o << 8) | c));
 }
+static void dv_rx_on(void); static void dv_rx_off(void); static void led(int red, int green);
+
 static void rx_start(void)
 {
     bk4829_bb_loops = 155;
@@ -185,9 +193,11 @@ static void rx_start(void)
     gpio_set_pin(GPIOB, GPIO_PIN_8);                        /* amplifier on */
     gpio_set_pin(GPIOE, GPIO_PIN_4);                        /* speaker enable (needed: no audio with it low) */
     rx_on = 1;
+    dv_rx_on();
 }
 static void rx_stop(void)
 {
+    dv_rx_off();
     gpio_set_pin(GPIOE, GPIO_PIN_1);                        /* mute */
     gpio_clear_pin(GPIOE, GPIO_PIN_4);
     gpio_clear_pin(GPIOB, GPIO_PIN_8);                      /* internal mic */
@@ -207,6 +217,7 @@ static void rx_poll(void)                                   /* from the idle loo
     if (!rx_sql) rx_open = 1;
     else if (rssi >= sq_open[rx_sql - 1]) rx_open = 1;
     else if (rssi + 6 < sq_open[rx_sql - 1]) rx_open = 0;
+    if (dv_active) return;                                  /* the DV player owns the speaker */
     if (rx_open) gpio_clear_pin(GPIOE, GPIO_PIN_1); else gpio_set_pin(GPIOE, GPIO_PIN_1);
 }
 
@@ -224,6 +235,11 @@ static int16_t eq_hist[2 * EQ_TAPS];
 static uint32_t eq_pos;
 static int32_t dc_q8 = 1220 << 8;
 static volatile int raw_cap;
+#define XRING 1024
+static volatile int16_t xring[XRING];                 /* DV receive: PA2 at 19.2 kHz, DC removed, x8 */
+static volatile int16_t rref[XRING];                  /* the DAC's output at each of those samples */
+static volatile uint32_t x_head; static uint32_t x_tail;
+static volatile int rx_dv; static int32_t rdc_q8 = 1220 << 8;
 static volatile uint32_t dac_inc, dac_ph;      /* D<hz>: DAC1 (PA4) test sine during capture, 0 = off */
 static const int16_t sin64[64] = {0,50,100,149,196,241,284,325,362,396,426,452,473,490,502,510,512,510,502,490,473,452,426,396,362,325,284,241,196,149,100,50,0,-50,-100,-149,-196,-241,-284,-325,-362,-396,-426,-452,-473,-490,-502,-510,-512,-510,-502,-490,-473,-452,-426,-396,-362,-325,-284,-241,-196,-149,-100,-50};   /* one period */             /* R command: ring gets the pre-EQ samples */
 
@@ -238,6 +254,13 @@ static uint16_t adc_fast(void)
 void TIM6_IRQHandler(void)
 {
     TIM6->SR = 0;
+    if (rx_dv) {
+        int32_t a = (int32_t)adc_fast() << 8;
+        rdc_q8 += (a - rdc_q8) >> 12;
+        xring[x_head % XRING] = (int16_t)((a - rdc_q8) >> 5);
+        rref[x_head % XRING] = (int16_t)((int32_t)(DAC->DOR1 & 0xFFF) - 2048); x_head++;
+        return;
+    }
     if (dac_inc) { dac_ph += dac_inc; DAC->DHR12R1 = (uint32_t)(2048 + sin64[dac_ph >> 26]); }
     int32_t a = (int32_t)adc_fast() << 8;
     dc_q8 += (a - dc_q8) >> 12;
@@ -274,10 +297,21 @@ static uint8_t yring[YRING];
 static volatile uint32_t y_head, y_tail, y_underrun;
 static volatile uint8_t y_last;
 
+#define PRING 4096
+static int16_t pring[PRING];                         /* decoded speech for the DAC, 8 kHz */
+static volatile uint32_t p_tail; static uint32_t p_head; static volatile int dac_play, dac_run;
 void TIM7_IRQHandler(void)
 {
     static const int8_t lv[4] = {-3, -1, 1, 3};
     TIM7->SR = 0;
+    if (dac_play) {                                  /* start once 60 ms are queued; rebuffer if dry */
+        int32_t v = 0;
+        if (!dac_run && p_head - p_tail >= 480) dac_run = 1;
+        if (dac_run) { if (p_tail != p_head) { v = pring[p_tail % PRING]; p_tail++; } else dac_run = 0; }
+        v = 2048 + (v >> 3);                         /* compressed speech: x2 into the 12-bit DAC */
+        DAC->DHR12R1 = (uint32_t)(v < 0 ? 0 : v > 4095 ? 4095 : v);
+        return;
+    }
     uint8_t t;
     if (y_tail != y_head) { t = yring[y_tail % YRING]; y_tail++; }
     else { y_underrun++; t = (uint8_t)(y_last == 0 ? 3 : 0); }  /* keep alternating outer tones */
@@ -297,6 +331,123 @@ static void symbols_start(int on)
 }
 
 static void push_sym(uint8_t t) { yring[y_head % YRING] = t; y_head++; }
+
+/* ------------------------------------------------------------------ DV receive (idle) */
+/* Chip 1 receives (rx_start); its FM audio on PA2 is sampled at 19.2 kHz (TIM6) into dvrx. On
+   lock the speaker switches from the BK's FM audio (PC12 high) to the MCU's DAC (PC12 low, TIM7
+   8 kHz) playing the sotto decoder's output; after the over it switches back. Chip 0 is off while
+   receiving: in mic mode it adds noise to PA2 and couples the DAC in (rxpath test, e580007). */
+extern void *malloc(size_t);
+static struct dvrx *dvr; static struct sotto_lr_dec *sdec;
+static size_t dv_heap_mark; static int dv_ending; static uint32_t dv_maxcyc;
+static struct dyn dv_dyn;                   /* playback compressor: the DAC path is weaker than the BK's */
+#define EC_L 8
+#define EC_MU 0.05f
+static float ec_w[EC_L], ec_h[EC_L], ec_pw;
+static void timer6_rx(int on)
+{
+    TIM6->CR1 = 0; NVIC_DisableIRQ(TIM6_IRQn); rx_dv = on;
+    if (!on) return;
+    CRM->APB1EN |= CRM_APB1EN_TIM6EN;
+    TIM6->PSC = 24; TIM6->ARR = 499;                            /* 240 MHz / 25 / 500 = 19.2 kHz */
+    TIM6->EGR = 1; TIM6->SR = 0; TIM6->DIER = 1;
+    NVIC_SetPriority(TIM6_IRQn, 1); NVIC_EnableIRQ(TIM6_IRQn);
+    TIM6->CR1 = 1;
+}
+static void dac_player(int on)
+{
+    TIM7->CR1 = 0; NVIC_DisableIRQ(TIM7_IRQn); dac_run = 0; dac_play = on; DAC->DHR12R1 = 2048;
+    if (!on) return;
+    p_head = p_tail = 0;
+    CRM->APB1EN |= CRM_APB1EN_TIM7EN;
+    TIM7->PSC = 29; TIM7->ARR = 999;                            /* 8 kHz */
+    TIM7->EGR = 1; TIM7->SR = 0; TIM7->DIER = 1;
+    NVIC_SetPriority(TIM7_IRQn, 2); NVIC_EnableIRQ(TIM7_IRQn);
+    TIM7->CR1 = 1;
+}
+static void dv_speaker(int dv)
+{
+    /* PC12 low only adds the DAC to the node the BK's audio (and PA2) sit on: turn the BK down
+       (REG_48 B003: still decodable on PA2, -42 dBFS) and buffer the DAC so it owns the speaker */
+    if (dv) {
+        bk4829_write_reg(1, 0x48, 0xB003); DAC->CR &= ~(1UL << 1);
+        gpio_clear_pin(GPIOC, GPIO_PIN_12); gpio_clear_pin(GPIOE, GPIO_PIN_1); led(1, 1);
+        dv_active = 1;
+    } else {
+        gpio_set_pin(GPIOC, GPIO_PIN_12); DAC->CR |= (1UL << 1); led(0, 0);
+        dv_active = 0; rx_set_volume();
+    }
+}
+static void dv_rx_on(void)
+{
+    bk4829_write_reg(0, 0x30, 0); bk4829_write_reg(0, 0x47, 0); bk4829_write_reg(0, 0x48, 0);
+    heap_used = 0;
+    dvr = (struct dvrx *)malloc(dvrx_size()); if (!dvr) { out_s("DV no memory\r\n"); return; }
+    dvrx_init(dvr); dv_heap_mark = heap_used; sdec = 0; dv_ending = 0; dv_active = 0;
+    x_head = x_tail = 0; rdc_q8 = 1220 << 8;
+    timer6_rx(1);
+}
+static void dv_rx_off(void)
+{
+    timer6_rx(0); dac_player(0);
+    if (dv_active) dv_speaker(0);
+    dv_ending = 0; dvr = 0; sdec = 0;
+    bk_apply(mic_setup, (int)(sizeof mic_setup / sizeof mic_setup[0]));   /* chip 0 back to mic capture for TX */
+}
+static void pcm_push(const int16_t *y, int n)
+{
+    for (int i = 0; i < n; i++) { if (p_head - p_tail >= PRING) return; pring[p_head % PRING] = y[i]; p_head++; }
+}
+static void dv_poll(void)
+{
+    if (!dvr) return;
+    /* the DAC leaks into PA2 (13 dB over the DV signal at quarter scale): NLMS canceller with the
+       DAC output sampled at the same instants as the reference */
+    while (x_tail != x_head) {
+        if (x_head - x_tail > XRING) x_tail = x_head - XRING;              /* overrun: skip */
+        float xr = xring[x_tail % XRING];
+        for (int k = EC_L - 1; k > 0; k--) ec_h[k] = ec_h[k - 1];
+        ec_h[0] = rref[x_tail % XRING];
+        float y = xr;
+        for (int k = 0; k < EC_L; k++) y -= ec_w[k] * ec_h[k];
+        if (dv_active) {
+            ec_pw += 0.002f * (ec_h[0] * ec_h[0] - ec_pw);
+            float g = EC_MU * y / (EC_L * ec_pw + 100.0f);
+            for (int k = 0; k < EC_L; k++) ec_w[k] += g * ec_h[k];
+        }
+        x_tail++;
+        dvrx_push(dvr, (int16_t)(y > 32767 ? 32767 : y < -32767 ? -32767 : y));
+    }
+    uint8_t sf[6]; int good, ev; int16_t pcm[SOTTO_LR_SAMPLES_PER_FRAME];
+    uint32_t c0 = CYC;
+    while ((ev = dvrx_step(dvr, sf, &good)) != DVRX_NONE) {
+        if (ev == DVRX_LOCK) {
+            heap_used = dv_heap_mark; sdec = sotto_lr_dec_create();    /* a fresh decoder per over */
+            for (int k = 0; k < EC_L; k++) ec_w[k] = ec_h[k] = 0;
+            dyn_reset(&dv_dyn);
+            ec_pw = 0;
+            dac_player(1); dv_speaker(1); dv_ending = 0; dv_maxcyc = 0;
+            dvrx_relevel_at(dvr, dvrx_count(dvr) + (x_head - x_tail) + 64);   /* the BK just got 35 dB quieter */
+            out_s("DV lock\r\n");
+        } else if (ev == DVRX_FRAME && sdec) {
+            sotto_lr_decode(sdec, sf, good, pcm);
+            for (int i = 0; i < SOTTO_LR_SAMPLES_PER_FRAME; i += DY_B) dyn_block(&dv_dyn, pcm + i);
+            pcm_push(pcm, SOTTO_LR_SAMPLES_PER_FRAME);
+        } else if (ev == DVRX_END && sdec) {
+            while (sotto_lr_dec_flush(sdec, pcm)) {
+                for (int i = 0; i < SOTTO_LR_SAMPLES_PER_FRAME; i += DY_B) dyn_block(&dv_dyn, pcm + i);
+                pcm_push(pcm, SOTTO_LR_SAMPLES_PER_FRAME);
+            }
+            int f, b, se; dvrx_stats(dvr, &f, &b, &se);
+            out_s("DV end frames="); out_u((uint32_t)f); out_s(" bad="); out_u((uint32_t)b);
+            out_s(" ser_milli="); out_u((uint32_t)se); out_s(" max_cyc="); out_u(dv_maxcyc);
+            out_s(" pcm_queued="); out_u(p_head); out_s(" played="); out_u(p_tail); out_s(" ec_w0="); out_u((uint32_t)(int32_t)(ec_w[0] * 1000)); out_s("\r\n");
+            dv_ending = 1;
+        }
+        uint32_t dt = CYC - c0; if (dt > dv_maxcyc) dv_maxcyc = dt; c0 = CYC;
+    }
+    if (dv_ending && p_tail == p_head) { dac_player(0); dv_speaker(0); dv_ending = 0; }
+}
 
 /* ------------------------------------------------------------------ FEC + framing */
 static int parity7(uint32_t x) { x ^= x >> 4; x ^= x >> 2; x ^= x >> 1; return (int)(x & 1); }
@@ -500,7 +651,7 @@ int main(void)
     uint32_t down_ms = 0;
     rx_start();
     for (;;) {
-        housekeeping(); if (rx_on) rx_poll();
+        housekeeping(); if (rx_on) { rx_poll(); dv_poll(); }
 #ifdef KNOB_PROBE
         {   /* PE0 read three ways, 5 times a second */
             static uint32_t last;
@@ -564,6 +715,7 @@ int main(void)
             if (secs > 60) secs = 60;
             uint32_t n = secs * 8000;
             out_s("RAW "); out_u(n); out_s("\r\n");
+            int was_rx = rx_dv; timer6_rx(0);
             s_head = s_tail = s_overrun = 0; dc_q8 = 1220 << 8; raw_cap = 1;
             capture_start(1);
             for (uint32_t i = 0; i < n; ) {
@@ -573,6 +725,7 @@ int main(void)
                 uart_putc((uint8_t)v); uart_putc((uint8_t)(v >> 8));
             }
             capture_start(0); raw_cap = 0;
+            if (was_rx) timer6_rx(1);
             out_s("STAT pcm_overruns="); out_u(s_overrun); out_s("\r\nDONE\r\n");
         }
         else if (line[0] == 'V' || line[0] == 'Q') {   /* V<0-15> volume, Q<0-9> squelch (0 = open) */
@@ -605,6 +758,21 @@ int main(void)
             for (const char *q = line + 1; *q >= '0' && *q <= '9'; q++) hz = hz * 10 + (uint32_t)(*q - '0');
             dac_inc = (uint32_t)(((uint64_t)hz << 32) / 8000); if (!hz) DAC->DHR12R1 = 2048;
             out_s("ok\r\n");
+        }
+        else if (line[0] == 'B') {                 /* B1: DAC1 output buffer on (drives the speaker node), B0 off */
+            if (line[1] == '1') DAC->CR &= ~(1UL << 1); else DAC->CR |= (1UL << 1);
+            out_s("ok\r\n");
+        }
+        else if (line[0] == 'S') {                 /* S: 2 s 700 Hz test tone through the DV player path */
+            int16_t blk[80]; dac_player(1); dv_speaker(1);
+            for (int k = 0; k < 200; k++) {
+                for (int i = 0; i < 80; i++) blk[i] = (int16_t)(sin64[((uint32_t)(k * 80 + i) * 5734u >> 10) & 63] * 32);
+                while (p_head - p_tail > PRING - 100) housekeeping();
+                pcm_push(blk, 80);
+            }
+            while (p_tail != p_head) housekeeping();
+            out_s("S played="); out_u(p_tail); out_s(" gain="); out_u(dv_gain); out_s("\r\n");
+            dac_player(0); dv_speaker(0);
         }
         else if (line[0] == 'F') {                 /* F<secs>: timed FM over (max 60) */
             uint32_t secs = 0;
