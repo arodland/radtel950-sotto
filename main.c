@@ -1,6 +1,6 @@
 /* RT-950 Pro digital-voice transmitter, test image (v0).
  *
- * Mic (chip 0, no-RF capture, mic boost max) -> PA2 -> ADC at 8 kHz (TIM6) -> A26 EQ (FIR)
+ * Mic (chip 0, no-RF capture, mic boost max) -> PA2 -> ADC at 8 kHz (TIM6) -> "match" EQ (FIR) -> compressor/gate (dyn.h)
  * -> sotto 1200 (fixed-point encoder) -> 1 superframe a frame (40 ms) -> K=7 r1/2 + puncture +
  * interleave + Gray (dvframe.py is the reference) -> 4-tone AFSK on chip 1's tone generator,
  * one REG_71 write per symbol at exactly 1200 Bd (TIM7) -> UHF path at minimum APC.
@@ -23,6 +23,7 @@
 #include "drivers/bk4829.h"
 #include "sotto.h"
 #include "eq_coef.h"
+#include "dyn.h"
 
 extern void delay_ms(uint32_t ms);
 extern volatile uint32_t bk4829_bb_loops;
@@ -162,6 +163,7 @@ static volatile uint32_t s_overrun;
 static int16_t eq_hist[2 * EQ_TAPS];
 static uint32_t eq_pos;
 static int32_t dc_q8 = 1220 << 8;
+static volatile int raw_cap;             /* R command: ring gets the pre-EQ samples */
 
 static uint16_t adc_fast(void)
 {
@@ -184,7 +186,7 @@ void TIM6_IRQHandler(void)
     int64_t acc = 0;
     for (int k = 0; k < EQ_TAPS; k++) acc += (int32_t)h[k] * eq_coef[EQ_TAPS - 1 - k];
     eq_pos = eq_pos + 1 == EQ_TAPS ? 0 : eq_pos + 1;
-    int32_t y = (int32_t)(acc >> EQ_SHIFT);
+    int32_t y = raw_cap ? x : (int32_t)(acc >> EQ_SHIFT);
     if (y > 32767) y = 32767; else if (y < -32767) y = -32767;
     if (s_head - s_tail >= SRING) { s_overrun++; return; }
     sring[s_head % SRING] = (int16_t)y;
@@ -281,8 +283,9 @@ static void transmit(uint32_t secs)
 {
     static int16_t pcm[SOTTO_LR_SAMPLES_PER_FRAME];
     static uint8_t payload[INFO / 8];
+    static struct dyn dy;
     uint8_t sf[SOTTO_BYTES_PER_FRAME];
-    heap_used = 0;
+    heap_used = 0; dyn_reset(&dy);
     struct sotto_lr_enc *e = sotto_lr_enc_create();
     if (!e) { out_s("STAT alloc failed\r\nDONE\r\n"); return; }
     uint32_t frames = 0, nsf = 0, enc_max = 0, nenc = 0, fill_max = 0, pre = 0, fill_min = ~0u;
@@ -312,6 +315,7 @@ static void transmit(uint32_t secs)
             for (int i = 0; i < 80; i++) pcm[i] = sring[(s_tail + i) % SRING];
             s_tail += 80; taken += 80;
             uint32_t t0 = CYC;
+            for (int i = 0; i < 80; i += DY_B) dyn_block(&dy, pcm + i);   /* compressor + gate */
             sotto_lr_encode_part(e, pcm, 1);
             got = sotto_lr_enc_pop(e, sf);
             uint32_t dt = CYC - t0; enc_sum += dt; nenc++; if (dt > enc_max) enc_max = dt;
@@ -463,6 +467,26 @@ int main(void)
                 }
                 out_s("ok\r\n");
             }
+        }
+        else if (line[0] == 'R') {
+            /* R<secs>: no TX; stream the mic (DC removed, x16, before the EQ) as raw s16le
+               8 kHz: "RAW n" line, n samples, then DONE. 16 kB/s fits the 23 kB/s UART. */
+            uint32_t secs = 0;
+            for (const char *q = line + 1; *q >= '0' && *q <= '9'; q++) secs = secs * 10 + (uint32_t)(*q - '0');
+            if (secs < 1) secs = 1;
+            if (secs > 60) secs = 60;
+            uint32_t n = secs * 8000;
+            out_s("RAW "); out_u(n); out_s("\r\n");
+            s_head = s_tail = s_overrun = 0; dc_q8 = 1220 << 8; raw_cap = 1;
+            capture_start(1);
+            for (uint32_t i = 0; i < n; ) {
+                housekeeping();
+                if (s_head == s_tail) continue;
+                uint16_t v = (uint16_t)sring[s_tail % SRING]; s_tail++; i++;
+                uart_putc((uint8_t)v); uart_putc((uint8_t)(v >> 8));
+            }
+            capture_start(0); raw_cap = 0;
+            out_s("STAT pcm_overruns="); out_u(s_overrun); out_s("\r\nDONE\r\n");
         }
         else if (line[0] == 'T') {
             uint32_t secs = 0;
