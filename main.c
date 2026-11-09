@@ -223,7 +223,9 @@ static volatile uint32_t s_overrun;
 static int16_t eq_hist[2 * EQ_TAPS];
 static uint32_t eq_pos;
 static int32_t dc_q8 = 1220 << 8;
-static volatile int raw_cap;             /* R command: ring gets the pre-EQ samples */
+static volatile int raw_cap;
+static volatile uint32_t dac_inc, dac_ph;      /* D<hz>: DAC1 (PA4) test sine during capture, 0 = off */
+static const int16_t sin64[64] = {0,50,100,149,196,241,284,325,362,396,426,452,473,490,502,510,512,510,502,490,473,452,426,396,362,325,284,241,196,149,100,50,0,-50,-100,-149,-196,-241,-284,-325,-362,-396,-426,-452,-473,-490,-502,-510,-512,-510,-502,-490,-473,-452,-426,-396,-362,-325,-284,-241,-196,-149,-100,-50};   /* one period */             /* R command: ring gets the pre-EQ samples */
 
 static uint16_t adc_fast(void)
 {
@@ -236,6 +238,7 @@ static uint16_t adc_fast(void)
 void TIM6_IRQHandler(void)
 {
     TIM6->SR = 0;
+    if (dac_inc) { dac_ph += dac_inc; DAC->DHR12R1 = (uint32_t)(2048 + sin64[dac_ph >> 26]); }
     int32_t a = (int32_t)adc_fast() << 8;
     dc_q8 += (a - dc_q8) >> 12;
     int32_t x = (a - dc_q8) >> 4;                               /* 12-bit counts x 16 */
@@ -596,6 +599,12 @@ int main(void)
             }
             uint8_t e[32]; spi_flash_read(0x00F230, e, 32);
             out_s("EDGES"); for (int i = 0; i < 32; i++) { out_s(" "); out_u(e[i]); } out_s("\r\n");
+        }
+        else if (line[0] == 'D') {                 /* D<hz>: DAC1 sine (+-512 counts) while capturing; D0 off */
+            uint32_t hz = 0;
+            for (const char *q = line + 1; *q >= '0' && *q <= '9'; q++) hz = hz * 10 + (uint32_t)(*q - '0');
+            dac_inc = (uint32_t)(((uint64_t)hz << 32) / 8000); if (!hz) DAC->DHR12R1 = 2048;
+            out_s("ok\r\n");
         }
         else if (line[0] == 'F') {                 /* F<secs>: timed FM over (max 60) */
             uint32_t secs = 0;
