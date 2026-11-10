@@ -248,6 +248,7 @@ static void rx_poll(void)                                   /* from the idle loo
 }
 
 static bkw_t ovr[8]; static int n_ovr;
+static uint16_t pa36 = 0x8E79;               /* BK PA drive (REG_36) while keyed; keypad 0-3 set it with apc */
 static uint16_t apc = 2200;                 /* A<v>: DAC2 (PA5, PA power control) while keyed. Factory table at
                                                433 MHz: low 1968 (1.2 W with REG_36 = 0x8E79), mid 2496 (4.1 W);
                                                2200 is about 2 W. 0 = a few uW */      /* X c,rr,vvvv: extra writes after tx_setup (test knob) */
@@ -588,6 +589,7 @@ static void transmit(uint32_t secs)
     if (rx_on) rx_stop();
     led(1, 0); pa_route(1); DAC->DHR12R2 = apc;
     bk_apply(tx_setup, (int)(sizeof tx_setup / sizeof tx_setup[0]));
+    bk4829_write_reg(1, 0x36, pa36);
     bk_apply(ovr, n_ovr);
     bk4829_bb_loops = 30;                   /* symbol writes: ~20 us each */
     symbols_start(1);
@@ -660,6 +662,7 @@ static void transmit_fm(uint32_t secs)
     led(0, 1); bk4829_bb_loops = 155;
     pa_route(1); DAC->DHR12R2 = apc;
     bk_apply(fm_setup, (int)(sizeof fm_setup / sizeof fm_setup[0]));
+    bk4829_write_reg(1, 0x36, pa36);
     bk_apply(ovr, n_ovr);
     uint32_t up = 0, t0 = get_tick();
     if (secs) while (get_tick() - t0 < secs * 1000) { housekeeping(); delay_ms(1); }
@@ -671,6 +674,69 @@ static void transmit_fm(uint32_t secs)
     pa_route(0); DAC->DHR12R2 = 0; led(0, 0);
     out_s("FM over\r\n");
     rx_start();
+}
+
+/* Keypad 0-3: transmit power. Stock pairing of the BK's PA drive (REG_36, the open firmware's
+   bk4829_set_tx_power) with the factory APC table at 433 MHz (C command: UHF low/mid/high bytes
+   x 16); wattages as nicFW reports them. The green LED blinks level + 1 times. */
+static const struct { uint16_t r36, apc; const char *name; } power_levels[4] = {
+    {0x8E79, 0, "minimum (a few uW)"}, {0x8E79, 1968, "low (1.2 W)"},
+    {0xA498, 2496, "medium (4.1 W)"}, {0xF016, 3584, "high (8.9 W)"},
+};
+static int blink_left; static uint32_t blink_t;
+/* Keypad as wired (measured 2026-11-09 with the M scan; the open firmware's map is wrong):
+   rows PD7, PD6, PD5, PD4 (pulled up); keys 1/4/7/* join a row to ground, the other columns are
+   PC2 (2/5/8/0), PC1 (3/6/9/#), PC0 (OK, Menu, Back, V/M), PC3 (Up, Down, Left, Right); side
+   buttons PE5 and PA12 to ground. Scan: rows with no column driven (ground keys), then each column
+   driven low alone, the others floating. Returns a key character or 0. */
+static const char key_map[5][4] = {             /* [column: ground, PC0, PC1, PC2, PC3][row: PD7, PD6, PD5, PD4] */
+    {'1', '4', '7', '*'}, {'K', 'M', 'B', 'V'}, {'3', '6', '9', '#'}, {'2', '5', '8', '0'}, {'U', 'D', 'L', 'R'},
+};
+static void keys_init(void)
+{
+    for (int b = 0; b < 4; b++) { gpio_config_pin(GPIOC, (uint16_t)(1u << b), GPIO_MODE_INPUT, GPIO_CNF_PULL); gpio_set_pin(GPIOC, (uint16_t)(1u << b)); }
+    for (int r = 4; r < 8; r++) { gpio_config_pin(GPIOD, (uint16_t)(1u << r), GPIO_MODE_INPUT, GPIO_CNF_PULL); gpio_set_pin(GPIOD, (uint16_t)(1u << r)); }
+    gpio_config_pin(GPIOE, GPIO_PIN_5, GPIO_MODE_INPUT, GPIO_CNF_PULL); gpio_set_pin(GPIOE, GPIO_PIN_5);
+    gpio_config_pin(GPIOA, GPIO_PIN_12, GPIO_MODE_INPUT, GPIO_CNF_PULL); gpio_set_pin(GPIOA, GPIO_PIN_12);
+}
+static uint32_t rows_low(void) { for (volatile int d = 0; d < 400; d++) ; return (~GPIOD->IDR >> 4) & 0xFu; }   /* bit 0 = PD4 */
+static char key_scan(void)
+{
+    if (!(GPIOE->IDR & GPIO_PIN_5)) return 'S';                    /* side buttons */
+    if (!(GPIOA->IDR & GPIO_PIN_12)) return 'T';
+    uint32_t g = rows_low();
+    for (int col = 0; col < 5; col++) {
+        uint32_t r = g;
+        if (col) {
+            uint16_t pin = (uint16_t)(1u << (col == 1 ? 0 : col == 2 ? 1 : col == 3 ? 2 : 3));
+            gpio_clear_pin(GPIOC, pin); gpio_config_pin(GPIOC, pin, GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
+            r = rows_low() & ~g;
+            gpio_config_pin(GPIOC, pin, GPIO_MODE_INPUT, GPIO_CNF_PULL); gpio_set_pin(GPIOC, pin);
+        }
+        for (int row = 0; row < 4; row++) if (r & (1u << (3 - row))) return key_map[col][row];
+    }
+    return 0;
+}
+static void keys_poll(void)
+{
+    static uint32_t last; static char prev, held; static int same;
+    if (get_tick() - last < 10) return;
+    last = get_tick();
+    char k = key_scan();
+    same = k == prev ? same + 1 : 0; prev = k;
+    if (same == 3 && k != held) {                                   /* 30 ms stable: a press (or release) */
+        held = k;
+        if (k >= '0' && k <= '3') {
+            int lv = k - '0';
+            pa36 = power_levels[lv].r36; apc = power_levels[lv].apc;
+            out_s("PWR "); out_u((uint32_t)lv); out_s(" "); out_s(power_levels[lv].name); out_s("\r\n");
+            blink_left = 2 * (lv + 1); blink_t = get_tick();
+        } else if (k) { out_s("KEY "); uart_putc((uint8_t)k); out_s("\r\n"); }
+    }
+    if (blink_left && !dv_active && get_tick() - blink_t >= 150) {   /* on/off 150 ms each */
+        blink_t = get_tick(); blink_left--;
+        led(0, blink_left & 1);
+    }
 }
 
 int main(void)
@@ -721,7 +787,7 @@ int main(void)
     fec_init();
     bk_apply(mic_setup, (int)(sizeof mic_setup / sizeof mic_setup[0]));
 
-    gpio_config_pin(GPIOC, GPIO_PIN_12, GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP); encoder_init();
+    gpio_config_pin(GPIOC, GPIO_PIN_12, GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP); encoder_init(); keys_init();
     out_s("\r\ndvtx ready\r\n");
     char line[20];
     gpio_config_pin(GPIOE, GPIO_PIN_3, GPIO_MODE_INPUT, GPIO_CNF_PULL); gpio_set_pin(GPIOE, GPIO_PIN_3);  /* PTT1 */
@@ -730,7 +796,7 @@ int main(void)
     uint32_t down_ms = 0;
     rx_start();
     for (;;) {
-        housekeeping(); if (rx_on) { rx_poll(); dv_poll(); }
+        housekeeping(); if (rx_on) { rx_poll(); dv_poll(); keys_poll(); }
 #ifdef KNOB_PROBE
         {   /* PE0 read three ways, 5 times a second */
             static uint32_t last;
@@ -816,7 +882,7 @@ int main(void)
         else if (line[0] == 'I') {                 /* I: receiver status */
             out_s("RX rssi="); out_u(rx_rssi); out_s(" reg0c="); out_u(bk4829_read_reg(1, 0x0C));
             out_s(" open="); out_u((uint32_t)rx_open); out_s(" vol="); out_u((uint32_t)rx_vol); out_s(" sql="); out_u((uint32_t)rx_sql);
-            out_s(" dv_overs="); out_u(dv_overs);
+            out_s(" apc="); out_u(apc); out_s(" r36="); out_u(pa36); out_s(" dv_overs="); out_u(dv_overs);
             if (dvr) { int f, b, se; dvrx_stats(dvr, &f, &b, &se); out_s(" last: frames="); out_u((uint32_t)f); out_s(" bad="); out_u((uint32_t)b); out_s(" ser_milli="); out_u((uint32_t)se); }
             out_s("\r\n");
         }
@@ -948,6 +1014,67 @@ int main(void)
             }
             gpio_config_pin(GPIOA, GPIO_PIN_0, GPIO_MODE_INPUT, GPIO_CNF_ANALOG); gpio_config_pin(GPIOA, GPIO_PIN_1, GPIO_MODE_INPUT, GPIO_CNF_ANALOG);
             out_s("J done\r\n");
+        }
+        else if (line[0] == 'M') {                 /* M<secs>: matrix scan with one column (PC0-3) driven low at a
+                                                      time and the others floating (pulled-up inputs); also the rows
+                                                      with no column driven. Prints the 5 row nibbles on any change */
+            uint32_t secs = 0;
+            for (const char *q = line + 1; *q >= '0' && *q <= '9'; q++) secs = secs * 10 + (uint32_t)(*q - '0');
+            uint32_t t0 = get_tick(), prev = 0xFFFFFFFF;
+            while (get_tick() - t0 < secs * 1000) {
+                housekeeping();
+                uint32_t pat = 0;
+                for (int c = 0; c < 5; c++) {
+                    for (int b = 0; b < 4; b++) { gpio_config_pin(GPIOC, (uint16_t)(1u << b), GPIO_MODE_INPUT, GPIO_CNF_PULL); gpio_set_pin(GPIOC, (uint16_t)(1u << b)); }
+                    if (c < 4) { gpio_clear_pin(GPIOC, (uint16_t)(1u << c)); gpio_config_pin(GPIOC, (uint16_t)(1u << c), GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP); }
+                    for (volatile int d = 0; d < 400; d++) ;
+                    pat |= ((~GPIOD->IDR >> 4) & 0xFu) << (4 * c);
+                }
+                pat |= (uint32_t)(!(GPIOE->IDR & GPIO_PIN_5)) << 20 | (uint32_t)(!(GPIOA->IDR & GPIO_PIN_12)) << 21;
+                if (pat != prev) {
+                    prev = pat;
+                    static const char hx[] = "0123456789ABCDEF";
+                    out_s("M PC0:"); uart_putc((uint8_t)hx[pat & 15]); out_s(" PC1:"); uart_putc((uint8_t)hx[(pat >> 4) & 15]);
+                    out_s(" PC2:"); uart_putc((uint8_t)hx[(pat >> 8) & 15]); out_s(" PC3:"); uart_putc((uint8_t)hx[(pat >> 12) & 15]);
+                    out_s(" none:"); uart_putc((uint8_t)hx[(pat >> 16) & 15]); out_s(" PE5:"); out_u((pat >> 20) & 1); out_s(" PA12:"); out_u((pat >> 21) & 1); out_s("\r\n");
+                }
+                delay_ms(5);
+            }
+            keys_init();
+            out_s("M done\r\n");
+        }
+        else if (line[0] == 'Z') {                 /* Z<secs>: find the keypad columns. PC0-3 become pulled-up inputs;
+                                                      each row PD4-7 is driven low in turn and every input pin that
+                                                      follows it low is reported (a held key joins row and column) */
+            uint32_t secs = 0;
+            for (const char *q = line + 1; *q >= '0' && *q <= '9'; q++) secs = secs * 10 + (uint32_t)(*q - '0');
+            GPIO_TypeDef *pt[5] = {GPIOA, GPIOB, GPIOC, GPIOD, GPIOE};
+            for (int b = 0; b < 4; b++) { gpio_config_pin(GPIOC, (uint16_t)(1u << b), GPIO_MODE_INPUT, GPIO_CNF_PULL); gpio_set_pin(GPIOC, (uint16_t)(1u << b)); }
+            uint32_t t0 = get_tick(), lastrep[4] = {0, 0, 0, 0};
+            while (get_tick() - t0 < secs * 1000) {
+                housekeeping();
+                for (int r = 0; r < 4; r++) {
+                    uint16_t rp = (uint16_t)(1u << (4 + r));
+                    uint32_t base[5], low[5];
+                    for (int p = 0; p < 5; p++) base[p] = pt[p]->IDR & 0xFFFF;
+                    gpio_clear_pin(GPIOD, rp); gpio_config_pin(GPIOD, rp, GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
+                    for (volatile int d = 0; d < 400; d++) ;
+                    for (int p = 0; p < 5; p++) low[p] = pt[p]->IDR & 0xFFFF;
+                    gpio_config_pin(GPIOD, rp, GPIO_MODE_INPUT, GPIO_CNF_PULL); gpio_set_pin(GPIOD, rp);
+                    for (volatile int d = 0; d < 400; d++) ;
+                    uint32_t sig = 0;
+                    for (int p = 0; p < 5; p++) { uint32_t fell = base[p] & ~low[p]; if (p == 3) fell &= ~(uint32_t)rp; if (fell) sig = sig * 131 + (uint32_t)p * 65536 + fell; }
+                    if (sig != lastrep[r]) {
+                        lastrep[r] = sig;
+                        out_s("ZROW PD"); out_u((uint32_t)(4 + r)); out_s(" low pulls:");
+                        for (int p = 0; p < 5; p++) { uint32_t fell = base[p] & ~low[p]; if (p == 3) fell &= ~(uint32_t)rp;
+                            for (int b = 0; b < 16; b++) if ((fell >> b) & 1) { out_s(" P"); uart_putc((uint8_t)('A' + p)); out_u((uint32_t)b); } }
+                        out_s("\r\n");
+                    }
+                }
+            }
+            keys_init();
+            out_s("Z done\r\n");
         }
         else if (line[0] == 'S') {                 /* S: 2 s 700 Hz test tone through the DV player path */
             int16_t blk[80]; dac_player(1); dv_speaker(1);
