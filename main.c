@@ -877,6 +877,69 @@ int main(void)
             for (uint32_t i = 0; i < 2 * gcap_n; i++) { uart_putc((uint8_t)pring[i]); uart_putc((uint8_t)((uint16_t)pring[i] >> 8)); }
             out_s("DONE\r\n");
         }
+        else if (line[0] == 'Y' && line[1] && line[2] == ',') {   /* Yc,rr: read a BK4829 register (hex) */
+            uint32_t c = (uint32_t)(line[1] - '0'), rr = 0;
+            for (const char *q = line + 3; *q; q++) rr = rr * 16 + (uint32_t)(*q <= '9' ? *q - '0' : (*q | 32) - 'a' + 10);
+            bk4829_bb_loops = 155;
+            uint16_t v = bk4829_read_reg((uint8_t)c, (uint8_t)rr);
+            static const char hx[] = "0123456789ABCDEF";
+            out_s("Y "); out_u(c); out_s(","); uart_putc((uint8_t)hx[(rr >> 4) & 15]); uart_putc((uint8_t)hx[rr & 15]);
+            out_s(" = "); for (int k = 12; k >= 0; k -= 4) uart_putc((uint8_t)hx[(v >> k) & 15]); out_s("\r\n");
+        }
+        else if (line[0] == 'J') {                 /* J: which MCU pins do the BK4829s' GPIOs reach? Receive only.
+                                                      Per chip and GPIO: enable that output alone (REG_33), drive it
+                                                      low / high (output select 0 = out_val) and see which input bits
+                                                      follow; then select code 15 (a fast clock on the K6's FD6818) and
+                                                      count edges per pin. Registers restored after each. */
+            GPIO_TypeDef *pt[5] = {GPIOA, GPIOB, GPIOC, GPIOD, GPIOE};
+            static uint32_t edges[5][16];
+            bk4829_bb_loops = 155;
+            gpio_config_pin(GPIOA, GPIO_PIN_0, GPIO_MODE_INPUT, GPIO_CNF_FLOATING);   /* analog pins read 0: make them digital */
+            gpio_config_pin(GPIOA, GPIO_PIN_1, GPIO_MODE_INPUT, GPIO_CNF_FLOATING);
+            for (int c = 0; c < 2; c++) {
+                uint16_t r33 = bk4829_read_reg((uint8_t)c, 0x33), r34 = bk4829_read_reg((uint8_t)c, 0x34), r35 = bk4829_read_reg((uint8_t)c, 0x35);
+                out_s("J chip "); out_u((uint32_t)c); out_s(" r33/34/35 "); out_u(r33); out_s(" "); out_u(r34); out_s(" "); out_u(r35); out_s("\r\n");
+                for (int g = 0; g < 8; g++) {
+                    uint16_t selreg = g < 4 ? 0x34 : 0x35, base = g < 4 ? r34 : r35; int sh = (g & 3) * 4;
+                    uint16_t en = (uint16_t)(r33 & ~(1u << (8 + g)));
+                    uint32_t lo[5], hi[5];
+                    for (int ph = 0; ph < 2; ph++) {
+                        bk4829_write_reg((uint8_t)c, selreg, (uint16_t)(base & ~(0xFu << sh)));          /* select 0: out_val */
+                        bk4829_write_reg((uint8_t)c, 0x33, (uint16_t)(ph ? (en | (1u << g)) : (en & ~(1u << g))));
+                        delay_ms(2);
+                        for (int p = 0; p < 5; p++) (ph ? hi : lo)[p] = pt[p]->IDR & 0xFFFF;
+                    }
+                    out_s("J c"); out_u((uint32_t)c); out_s(" gp"); out_u((uint32_t)g); out_s(" follow:");
+                    for (int p = 0; p < 5; p++) for (int b = 0; b < 16; b++)
+                        if (((lo[p] ^ hi[p]) >> b) & 1) { out_s(" P"); uart_putc((uint8_t)('A' + p)); out_u((uint32_t)b); out_s((hi[p] >> b) & 1 ? "+" : "-"); }
+                    for (uint32_t code = 9; code <= 15; code++) {           /* K6: 12-14 = IF bitstream, 15 = 13 MHz */
+                        bk4829_write_reg((uint8_t)c, selreg, (uint16_t)((base & ~(0xFu << sh)) | (code << sh)));
+                        bk4829_write_reg((uint8_t)c, 0x33, en);
+                        delay_ms(2);
+                        memset(edges, 0, sizeof edges);
+                        uint32_t prev[5]; for (int p = 0; p < 5; p++) prev[p] = pt[p]->IDR;
+                        __disable_irq();
+                        for (int k = 0; k < 50000; k++)
+                            for (int p = 0; p < 5; p++) {
+                                uint32_t v = pt[p]->IDR, d = (v ^ prev[p]) & 0xFFFF; prev[p] = v;
+                                while (d) { int b = __builtin_ctz(d); edges[p][b]++; d &= d - 1; }
+                            }
+                        __enable_irq();
+                        housekeeping();
+                        int any = 0;
+                        for (int p = 0; p < 5; p++) for (int b = 0; b < 16; b++)
+                            if (edges[p][b] > 20) {
+                                if (!any) { out_s(" | code "); out_u(code); out_s(":"); any = 1; }
+                                out_s(" P"); uart_putc((uint8_t)('A' + p)); out_u((uint32_t)b); out_s("="); out_u(edges[p][b]);
+                            }
+                    }
+                    out_s("\r\n");
+                    bk4829_write_reg((uint8_t)c, 0x33, r33); bk4829_write_reg((uint8_t)c, 0x34, r34); bk4829_write_reg((uint8_t)c, 0x35, r35);
+                }
+            }
+            gpio_config_pin(GPIOA, GPIO_PIN_0, GPIO_MODE_INPUT, GPIO_CNF_ANALOG); gpio_config_pin(GPIOA, GPIO_PIN_1, GPIO_MODE_INPUT, GPIO_CNF_ANALOG);
+            out_s("J done\r\n");
+        }
         else if (line[0] == 'S') {                 /* S: 2 s 700 Hz test tone through the DV player path */
             int16_t blk[80]; dac_player(1); dv_speaker(1);
             for (int k = 0; k < 200; k++) {
