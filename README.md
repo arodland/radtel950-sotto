@@ -34,6 +34,11 @@ itself. About 235 ms mouth to ear (40 ms frames, decoder rebuilds a lone lost su
     decoded speech as FM. `--smeter` logs the S-meter. `dv_send.py` sends a DV over of a wav.
   - Symbol timing follows a slow loop (the radio's clock is steady); lock is held through
     about 0.5 s of bad frames, which the decoder conceals.
+  - `--if`: decode from the IC-9700's IF output (USB AF/IF output set to IF, 12 kHz centre) with
+    no FM demodulator: per-symbol correlation against IF templates (`ifT_init.npy`). About 5 dB
+    below the discriminator's threshold on `ifbench.py` (10% FER at 41 vs 46 dB-Hz).
+- `ifbench.py`: adds noise to a clean IF capture and compares the discriminator and IF detectors;
+  writes `ifT_init.npy`.
 - `dv_rx.py`: test receiver. It keys the radio over serial, then counts bit errors against the
   superframes the radio reports. Uses `../rig.py` for recording.
 - `gen_eq.py` -> `eq_coef.h`: the mic EQ (FIR, applied on the radio).

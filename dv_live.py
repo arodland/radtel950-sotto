@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Live dvtx receiver: IC-9700 USB audio in, decoded speech out on the default audio device.
-usage: dv_live.py [--src PIPEWIRE_SOURCE] [--wav OUT.wav] [--hold N] [--noncoh] [--parrot] [--smeter OUT.tsv] [--replay AIR.wav]
+usage: dv_live.py [--if] [--src PIPEWIRE_SOURCE] [--wav OUT.wav] [--hold N] [--noncoh] [--parrot] [--smeter OUT.tsv] [--replay AIR.wav]
 Locks on 3 consecutive syncs a frame apart, decodes each frame coherently (coh.py: the air signal
 is continuous-phase 4-FSK; carrier phase carried from frame to frame, templates adapted as frames
 decode; --noncoh: Goertzel + tone-pair trellis as dv_rx.py), plays it, and drops lock after N bad
@@ -12,6 +12,7 @@ sys.path.insert(0, HERE)
 import dvframe as d
 from dv_rx import FS, SPS, TONES, FMT, FRAME, isi_metrics
 import coh
+from scipy.signal import firwin, lfilter, fftconvolve
 
 SRC = "alsa_input.usb-Burr-Brown_from_TI_USB_Audio_CODEC-00.analog-stereo"
 CHUNK = 960                            # 20 ms reads
@@ -36,6 +37,9 @@ class Decoder:
         return res
 
 class Rx:
+    LOCK_SCORE, BAD_SER, LOCK_SER = LOCK_SCORE, BAD_SER, 0.1
+    TGAIN, DGAIN = 0.3, 0.02                               # timing loop: phase and drift gains per frame
+    QNAME = "raw SER"
     def __init__(self, play, hold=BAD_RUN, clock=time.time, coherent=False):
         n = np.arange(SPS)
         self.kern = np.exp(2j * np.pi * np.outer(TONES, n) / FS)[:, ::-1]
@@ -48,13 +52,7 @@ class Rx:
         self.n = self.nbad = 0; self.sers = []; self.gmasks = []
 
     def feed(self, chunk):
-        self.x = np.concatenate([self.x, chunk - 0.0])
-        if self.coh: self.z = np.concatenate([self.z, self.an(chunk)])
-        new = len(self.x) - SPS + 1 - len(self.P)          # tone powers for every complete window
-        if new > 0:
-            seg = self.x[len(self.P): len(self.P) + new + SPS - 1]
-            p = np.stack([np.abs(np.convolve(seg, k, "valid")) for k in self.kern], 1)
-            self.P = np.concatenate([self.P, p])
+        self.front(chunk)
         if len(self.x) > KEEP + FS:                            # trim, keeping whole history needed
             cut = len(self.x) - KEEP
             if self.locked: cut = min(cut, self.t - self.off - 64)
@@ -63,6 +61,18 @@ class Rx:
                 if self.coh: self.z = self.z[cut:]
                 self.searched = max(self.searched - cut, 0)
         self.locked and self.track() or self.search()
+
+    def front(self, chunk):                                # append input; tone powers for every complete window
+        self.x = np.concatenate([self.x, chunk - 0.0])
+        if self.coh: self.z = np.concatenate([self.z, self.an(chunk)])
+        new = len(self.x) - SPS + 1 - len(self.P)
+        if new > 0:
+            seg = self.x[len(self.P): len(self.P) + new + SPS - 1]
+            p = np.stack([np.abs(np.convolve(seg, k, "valid")) for k in self.kern], 1)
+            self.P = np.concatenate([self.P, p])
+
+    def met(self, F): return isi_metrics(F, self.mu)       # (48, 4) normalized tone powers -> tone metrics
+    def quality(self, met, syms): return np.mean(met.argmax(1) != syms)   # frame score, low = good (raw SER)
 
     def at(self, t):                                       # (48, 4) tone powers of the frame at t
         M = self.P[t - self.off + np.arange(FMT.FRAME_SYMS) * SPS]
@@ -79,14 +89,14 @@ class Rx:
         if hi <= self.searched: return False
         lo = self.searched; self.searched = hi
         s0 = self.sync(lo, hi)
-        for r in np.where(s0 > LOCK_SCORE)[0]:
+        for r in np.where(s0 > self.LOCK_SCORE)[0]:
             t = lo + r
             ok = all(self.sync(t + k * FRAME - 2, t + k * FRAME + 3).max() > 0.2 for k in (1, 2))
             for k in (0, 1):                               # and the first two frames decode cleanly
                 if not ok: break
-                met = isi_metrics(self.at(self.off + t + k * FRAME), self.mu)
+                met = self.met(self.at(self.off + t + k * FRAME))
                 bits = FMT.frame_decode(met[d.SYNC_LEN:] / (np.std(met) + 1e-9))
-                ok = np.mean(met.argmax(1) != FMT.frame_symbols(bits)) < 0.1
+                ok = self.quality(met, FMT.frame_symbols(bits)) < self.LOCK_SER
             if ok:
                 self.locked, self.t, self.bad = True, self.off + t, 0
                 self.n = self.nbad = 0; self.sers = []; self.gmasks = []; self.t0 = time.time()
@@ -97,10 +107,10 @@ class Rx:
 
     def frame_at(self, r):                                 # decode the frame at relative start r
         F = self.P[r + np.arange(FMT.FRAME_SYMS) * SPS]; F = F / (np.median(F.max(1)) + 1e-9)
-        met = isi_metrics(F, self.mu)
+        met = self.met(F)
         bits = FMT.frame_decode(met[d.SYNC_LEN:] / (np.std(met) + 1e-9))
         syms = FMT.frame_symbols(bits)
-        ser = np.mean(met.argmax(1) != syms); self.met_data = met[d.SYNC_LEN:]
+        ser = self.quality(met, syms); self.met_data = met[d.SYNC_LEN:]
         if not self.coh: return ser, F, bits, syms
         # coherent: carrier phase = the phase carried from the last good frame (held through a
         # fade; 0/pi ambiguous after bad frames) combined with the sync symbols' estimate, then
@@ -153,7 +163,7 @@ class Rx:
         while int(round(self.tf)) - self.off + FRAME + 4 + SPS <= len(self.P):
             r0 = int(round(self.tf)) - self.off
             ser, F, bits, syms = self.frame_at(r0)
-            good = ser < BAD_SER
+            good = ser < self.BAD_SER
             e = 0.0
             if good:
                 e = self.timing_err(r0, syms)
@@ -167,7 +177,7 @@ class Rx:
             else:
                 self.last_sym = None; self.psi_amb = True
             # timing loop: the radio's symbol clock is steady, so follow the error slowly
-            self.tf += FRAME + self.drift + 0.3 * e; self.drift = float(np.clip(self.drift + 0.02 * e, -0.3, 0.3))
+            self.tf += FRAME + self.drift + self.TGAIN * e; self.drift = float(np.clip(self.drift + self.DGAIN * e, -0.3, 0.3))
             self.t = int(round(self.tf))
             if good and FMT.classes is not None:            # unequal protection: shape may be lost alone
                 sa, sb = FMT.class_ser(self.met_data, bits); gmask = 1 if sb < BAD_SER else 2
@@ -184,13 +194,46 @@ class Rx:
                 part = sum(g == 2 for g in self.gmasks[:-self.hold])
                 print(f"{self.stamp()} over: end, {n} frames ({n * FMT.FRAME_SYMS / 1200:.1f} s), "
                       f"{self.nbad - self.hold} bad" + (f", {part} shape-only" if part else "") +
-                      f", raw SER {np.mean(self.sers[:-self.hold] or [0]):.4f}", flush=True)
+                      f", {self.QNAME} {np.mean(self.sers[:-self.hold] or [0]):.4f}", flush=True)
                 self.locked = False; self.searched = self.t - self.off
                 if getattr(self, 'on_over_end', None): self.on_over_end()
                 return True
         return True
 
     def stamp(self): return time.strftime("%H:%M:%S", time.localtime(self.clock()))
+
+class IfRx(Rx):
+    """V2 from the IC-9700's IF output (USB AF/IF = IF, centre 12 kHz, 48 kHz) with no FM demodulator: below the
+    discriminator's threshold (ifbench.py: ~5 dB). The IF is mixed to baseband (+-8 kHz channel filter) and every
+    sample position gets per-tone metrics |<s, T>|, T the 40-sample IF waveforms of (previous tone, tone, audio phase
+    in 8 bins) (ifT_init.npy, learned by ifbench.py from a clean capture) maxed over previous tone and phase. They
+    stand in for the noncoherent receiver's tone powers (sync, lock, timing loop, hold) and go to the Viterbi as
+    they are. The mixer follows the signal's mean frequency on good frames (captures: within 30 Hz of 12 kHz)."""
+    # frame score: the re-encoded path's mean soft distance from the best tone (in metric sd), not raw SER:
+    # at 40-43 dB-Hz 0.11 keeps 95% of correct frames and passes 5% of wrong ones (SER: 23%)
+    LOCK_SCORE, BAD_SER, LOCK_SER, QNAME = LOCK_SCORE, 0.11, 0.1, "soft loss"
+    TGAIN, DGAIN = 0.1, 0.005                              # slower than the AF receiver: steadier at low C/N0
+    def __init__(self, play, hold=BAD_RUN, clock=time.time, fc=12000.0):
+        super().__init__(play, hold, clock, coherent=False)
+        self.K = np.load(os.path.join(HERE, "ifT_init.npy")).reshape(-1, SPS)[:, ::-1].conj()
+        self.ch = firwin(255, 8000, fs=FS); self.zi = np.zeros(254, complex); self.fc = fc; self.ph = 0.0
+        self.x = np.zeros(0, complex)
+    def front(self, chunk):
+        w = 2 * np.pi * self.fc / FS
+        mixed = chunk * np.exp(-1j * (self.ph + w * np.arange(len(chunk)))); self.ph = (self.ph + w * len(chunk)) % (2 * np.pi)
+        zb, self.zi = lfilter(self.ch, 1, mixed, zi=self.zi); self.x = np.concatenate([self.x, zb])
+        new = len(self.x) - SPS + 1 - len(self.P)
+        if new > 0:
+            seg = self.x[len(self.P): len(self.P) + new + SPS - 1]
+            C = np.abs(fftconvolve(seg[None], self.K, mode="valid", axes=1))
+            self.P = np.concatenate([self.P, C.reshape(4, 4, 8, -1).max((0, 2)).T])
+    def met(self, F): return F - F.mean(1, keepdims=True)
+    def quality(self, met, syms):
+        z = met / (met.std() + 1e-9); return (z.max(1) - z[np.arange(len(syms)), syms]).mean()
+    def timing_err(self, r0, syms):                        # called on good frames: follow the IF centre too
+        z = self.x[r0: r0 + FRAME]
+        self.fc = float(np.clip(self.fc + 0.1 * np.angle((z[1:] * z[:-1].conj()).sum()) * FS / (2 * np.pi), 11500, 12500))
+        return super().timing_err(r0, syms)
 
 class Civ:
     """IC-9700 over CI-V (address 0xA2): S-meter reads and PTT. One owner per port."""
@@ -247,6 +290,7 @@ class Parrot:
 def main():
     ap = argparse.ArgumentParser(); ap.add_argument("--src", default=SRC); ap.add_argument("--wav")
     ap.add_argument("--hold", type=int, default=BAD_RUN, help="bad frames in a row before dropping lock")
+    ap.add_argument("--if", dest="ifmode", action="store_true", help="decode from the 9700's IF output (USB AF/IF output = IF) without FM demodulation: IfRx")
     ap.add_argument("--noncoh", action="store_true", help="noncoherent (Goertzel + tone-pair trellis) detection instead of coh.py")
     ap.add_argument("--parrot", nargs="?", const="dv", choices=["dv", "fm"], help="retransmit each over on the IC-9700 (CI-V PTT, USB audio): dv relays the received superframes as a DV over (default), fm plays the decoded speech as FM")
     ap.add_argument("--smeter", metavar="OUT.tsv", help="log the IC-9700 S-meter every 0.5 s (unix time, raw)")
@@ -260,7 +304,8 @@ def main():
         wf = None
         if a.wav:
             wf = wave.open(a.wav, "wb"); wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(8000)
-        rx = Rx(lambda y: wf and wf.writeframes(y.tobytes()), a.hold, lambda: t0 + (rx.off + len(rx.x)) / FS, not a.noncoh)
+        pl, ck = (lambda y: wf and wf.writeframes(y.tobytes())), (lambda: t0 + (rx.off + len(rx.x)) / FS)
+        rx = IfRx(pl, a.hold, ck) if a.ifmode else Rx(pl, a.hold, ck, not a.noncoh)
         while b := w.readframes(CHUNK): rx.feed(np.frombuffer(b, np.int16).astype(float))
         if wf: wf.close()
         return
@@ -277,7 +322,7 @@ def main():
         out.stdin.write(y.tobytes()); out.stdin.flush()
         if wf: wf.writeframes(y.tobytes())
         if parrot: parrot.audio(y)
-    rx = Rx(play, a.hold, coherent=not a.noncoh)
+    rx = IfRx(play, a.hold) if a.ifmode else Rx(play, a.hold, coherent=not a.noncoh)
     if parrot: rx.on_over_end = parrot.over_end; rx.on_frame = parrot.frame
     if a.smeter:
         def smeter_log():
