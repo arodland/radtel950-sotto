@@ -133,9 +133,10 @@ static const bkw_t mic_setup[] = {          /* chip 0: mic capture "A" (mic boos
     TX_START(0), {0,0x40,0}, {0,0x47,0x6142}, {0,0x48,0xB092}, {0,0x7D,0xE91F}, {0,0x2C,0x003F},
     {0,0x2B,0}, {0,0x30,0}, {0,0x30,0x0206},
 };
-static const bkw_t tx_setup[] = {           /* chip 1: 432.950 MHz (same crystal correction as the 433.000 value), tones */
+static const bkw_t tx_setup[] = {           /* chip 1: 432.950 MHz (same crystal correction as the 433.000 value), tones;
+                                               REG_40 0x3800: 4.05 kHz peak deviation at 2400 Hz, 99% within +-5.5 kHz (IC-9700 IF capture) */
     TX_START(1), {1,0x38,0xA108}, {1,0x39,0x0294}, {1,0x30,0x0200}, {1,0x30,0xC3FE}, {1,0x47,0x6042},
-    {1,0x7D,0xE900}, {1,0x2C,0}, {1,0x36,0x8E79}, {1,0x40,0x3720}, {1,0x71,BASE_TONE}, {1,0x70,0xE000},
+    {1,0x7D,0xE900}, {1,0x2C,0}, {1,0x36,0x8E79}, {1,0x40,0x3800}, {1,0x71,BASE_TONE}, {1,0x70,0xE000},
 };
 
 static const bkw_t fm_setup[] = {           /* chip 1: FM voice at the same frequency and power (PTT2) */
@@ -209,6 +210,8 @@ static void rx_start(void)
     rx_route(1);
     bk4829_write_reg(1, 0x38, 0xA108); bk4829_write_reg(1, 0x39, 0x0294);
     bk4829_write_reg(1, 0x30, 0x0200); delay_ms(2);
+    bk4829_write_reg(1, 0x43, 0x3028);                       /* wide receive filter (25 kHz channel, +-5 kHz): the chip's
+                                                               default 0x4048 is narrow, TX_START's 0x3028 wide; was history-dependent */
     bk4829_write_reg(1, 0x30, 0xBFF1); bk4829_write_reg(1, 0x47, 0x6140);   /* AF = FM demod (0x6040 | 1 << 8); the open firmware's 0xFB67 sounded AM-like: level fell with RF */
     rx_set_volume(); rx_set_squelch();
     gpio_set_pin(GPIOC, GPIO_PIN_12);                       /* speaker from the BK, not the MCU DAC */
