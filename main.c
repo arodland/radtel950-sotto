@@ -333,6 +333,7 @@ static void capture_start(int on)
 static uint8_t yring[YRING];
 static volatile uint32_t y_head, y_tail, y_underrun;
 static volatile uint8_t y_last;
+static volatile int force_tone = -1;          /* U<k>,<secs>: transmit only tone k (constant-tone test) */
 
 #define PRING 4096
 static int16_t pring[PRING];                         /* decoded speech for the DAC, 8 kHz */
@@ -352,6 +353,11 @@ void TIM7_IRQHandler(void)
     uint8_t t;
     if (y_tail != y_head) { t = yring[y_tail % YRING]; y_tail++; }
     else { y_underrun++; t = (uint8_t)(y_last == 0 ? 3 : 0); }  /* keep alternating outer tones */
+    if (force_tone >= 0) t = (uint8_t)force_tone;
+    /* the 600 Hz tone comes out weak (transmit pre-emphasis / high-pass): 843 Hz deviation at
+       REG_70 0xE000 against ~1.77 x f for the others (constant-tone test, IF capture). 0xE800 gives
+       1045 Hz; above that the gain saturates. Written only when the tone enters or leaves 0. */
+    if ((t == 0) != (y_last == 0)) bk4829_write_reg(1, 0x70, t == 0 ? 0xE800 : 0xE000);
     y_last = t;
     bk4829_write_reg(1, 0x71, (uint16_t)(BASE_TONE + lv[t] * STEP_TONE));
 }
@@ -958,6 +964,13 @@ int main(void)
             uint32_t secs = 0;
             for (const char *q = line + 1; *q >= '0' && *q <= '9'; q++) secs = secs * 10 + (uint32_t)(*q - '0');
             transmit_fm(secs < 1 ? 1 : secs > 60 ? 60 : secs);
+        }
+        else if (line[0] == 'U' && line[1] >= '0' && line[1] <= '3') {   /* U<k>,<secs>: a DV over that sends only tone k */
+            uint32_t secs = 0;
+            for (const char *q = line + 3; *q >= '0' && *q <= '9'; q++) secs = secs * 10 + (uint32_t)(*q - '0');
+            force_tone = line[1] - '0';
+            transmit(secs < 1 ? 1 : secs > 10 ? 10 : secs);
+            force_tone = -1;
         }
         else if (line[0] == 'T') {
             uint32_t secs = 0;
