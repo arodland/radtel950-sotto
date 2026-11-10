@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Live dvtx receiver: IC-9700 USB audio in, decoded speech out on the default audio device.
-usage: dv_live.py [--if] [--src PIPEWIRE_SOURCE] [--wav OUT.wav] [--hold N] [--noncoh] [--parrot] [--smeter OUT.tsv] [--replay AIR.wav]
+usage: dv_live.py [--if] [--raw IN.wav] [--disc] [--src PIPEWIRE_SOURCE] [--wav OUT.wav] [--hold N] [--noncoh] [--parrot] [--smeter OUT.tsv] [--replay AIR.wav]
 Locks on 3 consecutive syncs a frame apart, decodes each frame coherently (coh.py: the air signal
 is continuous-phase 4-FSK; carrier phase carried from frame to frame, templates adapted as frames
 decode; --noncoh: Goertzel + tone-pair trellis as dv_rx.py), plays it, and drops lock after N bad
@@ -235,6 +235,14 @@ class IfRx(Rx):
         self.fc = float(np.clip(self.fc + 0.1 * np.angle((z[1:] * z[:-1].conj()).sum()) * FS / (2 * np.pi), 11500, 12500))
         return super().timing_err(r0, syms)
 
+def if_disc(x, fc=12000.0):
+    """IF recording (12 kHz centre) -> what an FM receiver's AF would be: +-8 kHz channel, discriminator, 3.4 kHz"""
+    z = lfilter(firwin(255, 8000, fs=FS), 1, x * np.exp(-2j * np.pi * fc * np.arange(len(x)) / FS))
+    f = np.r_[0, np.angle(z[1:] * z[:-1].conj())] * FS / (2 * np.pi)
+    f = lfilter(firwin(127, 3400, fs=FS), 1, f); f -= np.convolve(f, np.ones(1920) / 1920, "same")   # AC-coupled, as the AF is
+    k = 1 - np.exp(-1 / (60e-6 * FS)); f = lfilter([k], [1, k - 1], f)    # the AF's gentle roll-off (~60 us)
+    return f * 2                                                            # ~ the 9700's AF level (4 kHz dev -> 8000)
+
 class Civ:
     """IC-9700 over CI-V (address 0xA2): S-meter reads and PTT. One owner per port."""
     def __init__(self, port="/dev/ttyUSB0"):
@@ -291,6 +299,8 @@ def main():
     ap = argparse.ArgumentParser(); ap.add_argument("--src", default=SRC); ap.add_argument("--wav")
     ap.add_argument("--hold", type=int, default=BAD_RUN, help="bad frames in a row before dropping lock")
     ap.add_argument("--if", dest="ifmode", action="store_true", help="decode from the 9700's IF output (USB AF/IF output = IF) without FM demodulation: IfRx")
+    ap.add_argument("--raw", metavar="IN.wav", help="also record the raw 48 kHz input (and IN_start.txt) for --replay")
+    ap.add_argument("--disc", action="store_true", help="with --replay of an IF recording: FM-demodulate it in software and run the AF receiver (A/B against --if)")
     ap.add_argument("--noncoh", action="store_true", help="noncoherent (Goertzel + tone-pair trellis) detection instead of coh.py")
     ap.add_argument("--parrot", nargs="?", const="dv", choices=["dv", "fm"], help="retransmit each over on the IC-9700 (CI-V PTT, USB audio): dv relays the received superframes as a DV over (default), fm plays the decoded speech as FM")
     ap.add_argument("--smeter", metavar="OUT.tsv", help="log the IC-9700 S-meter every 0.5 s (unix time, raw)")
@@ -306,7 +316,9 @@ def main():
             wf = wave.open(a.wav, "wb"); wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(8000)
         pl, ck = (lambda y: wf and wf.writeframes(y.tobytes())), (lambda: t0 + (rx.off + len(rx.x)) / FS)
         rx = IfRx(pl, a.hold, ck) if a.ifmode else Rx(pl, a.hold, ck, not a.noncoh)
-        while b := w.readframes(CHUNK): rx.feed(np.frombuffer(b, np.int16).astype(float))
+        x = np.frombuffer(w.readframes(w.getnframes()), np.int16).astype(float)
+        if a.disc: x = if_disc(x); rx.mu = np.broadcast_to(np.eye(4), (4, 4, 4)).copy()   # mu_init.npy is the 9700's AF
+        for i in range(0, len(x), CHUNK): rx.feed(x[i:i + CHUNK])
         if wf: wf.close()
         return
     rec = subprocess.Popen(["pw-record", f"--target={a.src}", "--rate=48000", "--channels=1", "--format=s16",
@@ -316,6 +328,10 @@ def main():
     wf = None
     if a.wav:
         wf = wave.open(a.wav, "wb"); wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(8000)
+    raw = None
+    if a.raw:
+        raw = wave.open(a.raw, "wb"); raw.setnchannels(1); raw.setsampwidth(2); raw.setframerate(FS)
+        open(os.path.splitext(a.raw)[0] + "_start.txt", "w").write(f"{time.time():.3f}\n")
     civ = Civ() if (a.parrot or a.smeter) else None
     parrot = Parrot(civ, a.parrot_level, a.parrot == 'dv') if a.parrot else None
     def play(y):
@@ -337,12 +353,14 @@ def main():
         while True:
             b = rec.stdout.read(CHUNK * 2)
             if not b: break
+            if raw: raw.writeframes(b)
             rx.feed(np.frombuffer(b, np.int16).astype(float))
     except KeyboardInterrupt:
         pass
     finally:
         rec.terminate(); out.stdin.close(); out.wait()
         if wf: wf.close()
+        if raw: raw.close()
 
 if __name__ == "__main__":
     main()

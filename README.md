@@ -37,6 +37,8 @@ itself. About 235 ms mouth to ear (40 ms frames, decoder rebuilds a lone lost su
   - `--if`: decode from the IC-9700's IF output (USB AF/IF output set to IF, 12 kHz centre) with
     no FM demodulator: per-symbol correlation against IF templates (`ifT_init.npy`). About 5 dB
     below the discriminator's threshold on `ifbench.py` (10% FER at 41 vs 46 dB-Hz).
+    `--raw IN.wav` records the input; `--replay IN.wav --disc` runs the AF receiver on a software
+    discriminator of that IF recording, for an A/B on the same signal.
 - `ifbench.py`: adds noise to a clean IF capture and compares the discriminator and IF detectors;
   writes `ifT_init.npy`.
 - `dv_rx.py`: test receiver. It keys the radio over serial, then counts bit errors against the
